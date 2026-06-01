@@ -21,10 +21,12 @@ from PyQt6.QtGui import (QAction, QKeySequence, QShortcut, QColor,
 from core.config_io import DatasetConfig
 from core.annotation_io import load_annotations, save_annotations, get_images, get_label_path
 from core.image_ops import recalc_annotations_crop, recalc_annotations_rotate
+from core.folder_detect import detect_folder, execute_normalization
 from gui.editor.viewer import ImageViewer
 from gui.editor.items import BBoxItem, SegmentItem, class_color, set_label_px
 from gui.editor.image_list_widget import ImageListWidget
 from gui.style import SPLIT_COLORS
+from gui.dialogs.folder_import_dialog import FolderImportDialog
 
 # ─── SVG icon helpers ─────────────────────────────────────────────────────────
 
@@ -185,7 +187,7 @@ class MainWindow(QMainWindow):
         vlay.addWidget(splitter, 1)
         self.setCentralWidget(container)
 
-        self._status_lbl = QLabel("Open a YAML config to begin")
+        self._status_lbl = QLabel("Откройте папку датасета для начала работы")
         self.statusBar().addWidget(self._status_lbl)
 
     # ── Toolbar ───────────────────────────────────────────────────────────────
@@ -259,10 +261,10 @@ class MainWindow(QMainWindow):
         self._open_btn.setPopupMode(
             QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         self._open_btn.setToolTip(
-            "Открыть конфиг датасета\n▾ — история последних конфигов")
+            "Открыть папку датасета\n▾ — история / открыть YAML")
         self._open_menu = QMenu(self)
         self._open_btn.setMenu(self._open_menu)
-        self._open_btn.clicked.connect(self._open_new_config)
+        self._open_btn.clicked.connect(self._open_folder)
         self._populate_open_menu()
 
         self._undo_btn = QToolButton(self)
@@ -827,9 +829,12 @@ class MainWindow(QMainWindow):
 
     def _populate_open_menu(self):
         self._open_menu.clear()
-        act_new = QAction("Open new…", self)
-        act_new.triggered.connect(self._open_new_config)
-        self._open_menu.addAction(act_new)
+        act_folder = QAction("Открыть папку...", self)
+        act_folder.triggered.connect(self._open_folder)
+        self._open_menu.addAction(act_folder)
+        act_yaml = QAction("Открыть YAML конфиг...", self)
+        act_yaml.triggered.connect(self._open_new_config)
+        self._open_menu.addAction(act_yaml)
         hist = self._load_history()
         if hist:
             self._open_menu.addSeparator()
@@ -838,6 +843,40 @@ class MainWindow(QMainWindow):
                 act.triggered.connect(
                     lambda checked, _p=p: self._load_config_from_path(_p))
                 self._open_menu.addAction(act)
+
+    def _open_folder(self):
+        start_dir = ""
+        hist = self._load_history()
+        if hist:
+            parent = Path(hist[0]).parent
+            if parent.exists():
+                start_dir = str(parent)
+        folder = QFileDialog.getExistingDirectory(
+            self, "Выберите папку датасета", start_dir)
+        if not folder:
+            return
+        try:
+            result = detect_folder(Path(folder))
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось проанализировать папку:\n{e}")
+            return
+
+        if result.yaml_path:
+            self._load_config_from_path(str(result.yaml_path))
+            return
+
+        dlg = FolderImportDialog(result, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        accepted = dlg.accepted_keys()
+        class_names = dlg.class_names()
+        try:
+            yaml_path = execute_normalization(result, accepted, class_names)
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось выполнить преобразование:\n{e}")
+            return
+        self._load_config_from_path(str(yaml_path))
 
     def _open_new_config(self):
         start_dir = ""
