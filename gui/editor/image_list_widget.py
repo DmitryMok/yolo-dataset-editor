@@ -126,11 +126,8 @@ class ImageListWidget(QListWidget):
         vs = self._first_visible_row()
         ve = vs + self._estimate_visible_count()
         loaded = self._icons_loaded
-        priority = [i for i in range(max(0, vs), min(n, ve + 1)) if i not in loaded]
-        before  = [i for i in range(0, max(0, vs))               if i not in loaded]
-        after   = [i for i in range(min(n, ve + 1), n)           if i not in loaded]
-        return _IconLoader(self._paths, self.ICON_W, self.ICON_H,
-                           priority + before + after, self)
+        visible = [i for i in range(max(0, vs), min(n, ve + 1)) if i not in loaded]
+        return _IconLoader(self._paths, self.ICON_W, self.ICON_H, visible, self)
 
     def _first_visible_row(self) -> int:
         item = self.itemAt(0, 0)

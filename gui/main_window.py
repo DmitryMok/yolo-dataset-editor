@@ -405,19 +405,15 @@ class MainWindow(QMainWindow):
     def _build_assign_row(self) -> QWidget:
         row = QWidget()
         row.setObjectName("assign-row")
-        row.setFixedHeight(36)
+        row.setFixedHeight(32)
         lay = QHBoxLayout(row)
         lay.setContentsMargins(12, 0, 12, 0)
-        lay.setSpacing(8)
-
-        lbl = QLabel("SPLIT:")
-        lbl.setObjectName("assign-lbl")
-        lay.addWidget(lbl)
+        lay.setSpacing(4)
 
         seg_bg = QWidget()
         seg_bg.setObjectName("seg-bg")
         seg_lay = QHBoxLayout(seg_bg)
-        seg_lay.setContentsMargins(2, 2, 2, 2)
+        seg_lay.setContentsMargins(0, 0, 0, 0)
         seg_lay.setSpacing(2)
 
         self._split_btns: dict[str, QPushButton] = {}
@@ -432,6 +428,7 @@ class MainWindow(QMainWindow):
             btn.setProperty("split", name.lower())
             btn.setCheckable(True)
             btn.setFixedHeight(24)
+            btn.setFixedWidth(80)
             btn.setToolTip(_split_tips[name.lower()])
             btn.clicked.connect(
                 lambda _checked, s=name.lower(): self._on_assign_split(s))
@@ -1519,8 +1516,9 @@ class MainWindow(QMainWindow):
 
         target_dir = self._config.splits.get(target)
         if target_dir is None:
-            target_img_dir = self._config.config_dir / target / "images"
-            target_lbl_dir = self._config.config_dir / target / "labels"
+            declared = self._config.declared.get(target)
+            target_img_dir = declared if declared is not None else self._config.config_dir / target / "images"
+            target_lbl_dir = target_img_dir.parent / "labels"
             if target != "review":
                 reply = QMessageBox.question(
                     self, "Папка не найдена",

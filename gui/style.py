@@ -200,9 +200,8 @@ QCheckBox#auto-advance-cb {{
 }}
 #split-badge-btn::menu-indicator {{ image: none; }}
 #seg-bg {{
-    background: {BG};
-    border: 1px solid {BORDER_S};
-    border-radius: 5px;
+    background: transparent;
+    border: none;
 }}
 #split-btn {{
     background: transparent;

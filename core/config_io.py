@@ -18,13 +18,21 @@ class DatasetConfig:
         else:
             self.names: List[str] = list(names_raw)
 
-        self.splits: Dict[str, Path] = {}
-        for split in ['train', 'val', 'test']:
-            rel = data.get(split)
-            if rel:
-                resolved = self._resolve(rel)
-                if resolved:
-                    self.splits[split] = resolved
+        _META_KEYS = {'nc', 'names', 'path', 'download', 'roboflow'}
+        self.declared: Dict[str, Path] = {}  # intended paths from YAML, may not exist yet
+        self.splits: Dict[str, Path] = {}    # paths that actually exist
+        for key, value in data.items():
+            if key in _META_KEYS or not isinstance(value, str):
+                continue
+            self.declared[key] = (self.config_dir / value).resolve()
+            resolved = self._resolve(value)
+            if resolved:
+                self.splits[key] = resolved
+
+        # Detect review folder created by the app (not stored in YAML)
+        review_dir = (self.config_dir / "review" / "images").resolve()
+        if review_dir.exists():
+            self.splits["review"] = review_dir
 
     def _resolve(self, rel: str) -> Optional[Path]:
         """Resolve a YAML path against the config dir.
