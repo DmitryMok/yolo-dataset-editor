@@ -448,6 +448,14 @@ class MainWindow(QMainWindow):
         self._split_btns["review"] = self._defer_btn
         lay.addWidget(self._defer_btn)
 
+        self._move_enabled_cb = QCheckBox("Перенос")
+        self._move_enabled_cb.setObjectName("move-enabled-cb")
+        self._move_enabled_cb.setChecked(True)
+        self._move_enabled_cb.setToolTip(
+            "Переносить файл при нажатии 1/2/3/4\n"
+            "Снимите для навигации без перемещения файлов")
+        lay.addWidget(self._move_enabled_cb)
+
         lay.addStretch()
 
         cur_lbl = QLabel("текущий:")
@@ -925,9 +933,7 @@ class MainWindow(QMainWindow):
         for i in range(len(self._images)):
             self._apply_status_color(i)
 
-        self._viewer.scene().clear()
-        self._ann_items = []
-        self._ann_list.clear()
+        self._clear_scene()
         self._save_btn.setEnabled(False)
         self._del_file_btn.setEnabled(False)
         self._update_status()
@@ -1109,6 +1115,11 @@ class MainWindow(QMainWindow):
         if first_item is not None:
             self._viewer.scroll_to_item(first_item)
 
+    def _clear_scene(self):
+        self._viewer._safe_clear_scene()
+        self._ann_items = []
+        self._ann_list.clear()
+
     def _on_scene_selection_changed(self):
         if self._updating_ui:
             return
@@ -1241,9 +1252,7 @@ class MainWindow(QMainWindow):
             self._navigate_to(min(idx, len(self._images) - 1))
         else:
             self._current_idx = -1
-            self._viewer.scene().clear()
-            self._ann_items = []
-            self._ann_list.clear()
+            self._clear_scene()
             self._save_btn.setEnabled(False)
             self._del_file_btn.setEnabled(False)
             self._update_status()
@@ -1510,8 +1519,9 @@ class MainWindow(QMainWindow):
         if not self._images or self._current_idx < 0 or not self._config:
             return
         current = self._get_current_split()
-        if target == current:
+        if target == current or not self._move_enabled_cb.isChecked():
             self._update_assign_row()
+            self._next_image()
             return
 
         target_dir = self._config.splits.get(target)
@@ -1571,9 +1581,7 @@ class MainWindow(QMainWindow):
             self._navigate_to(min(idx, len(self._images) - 1))
         else:
             self._current_idx = -1
-            self._viewer.scene().clear()
-            self._ann_items = []
-            self._ann_list.clear()
+            self._clear_scene()
             self._save_btn.setEnabled(False)
             self._del_file_btn.setEnabled(False)
             self._update_status()

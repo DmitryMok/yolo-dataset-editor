@@ -226,12 +226,22 @@ class ImageViewer(QGraphicsView):
         self._crop_mode = False
         self._crop_item: CropOverlay | None = None
 
+    def _safe_clear_scene(self):
+        """Clear scene and null out all item references to prevent use-after-free."""
+        self._scene.blockSignals(True)
+        self._scene.clear()
+        self._scene.blockSignals(False)
+        self._pixmap_item = None
+        self._cross_h = None
+        self._cross_v = None
+        self._crop_item = None
+        self._crop_mode = False
+
     # ── public API ────────────────────────────────────────────────────────────
 
     def load_image(self, image_path: Path, annotations: List[Annotation],
                    classes: List[str]):
-        self._scene.clear()
-        self._pixmap_item = None
+        self._safe_clear_scene()
         self._classes = classes
 
         pix = QPixmap(str(image_path))
@@ -357,8 +367,7 @@ class ImageViewer(QGraphicsView):
     def reload_with_pixmap(self, pixmap: 'QPixmap', annotations: List[Annotation],
                            classes: List[str]):
         """Replace the displayed image without touching the file (crop / rotate preview)."""
-        self._scene.clear()
-        self._pixmap_item = None
+        self._safe_clear_scene()
         self._classes = classes
         if pixmap.isNull():
             return

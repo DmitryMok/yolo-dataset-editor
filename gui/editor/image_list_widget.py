@@ -3,7 +3,7 @@ from typing import List
 
 from PyQt6.QtWidgets import QListWidget, QLabel
 from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal, QThread
-from PyQt6.QtGui import QIcon, QPixmap, QImage
+from PyQt6.QtGui import QIcon, QPixmap, QImage, QColor
 
 
 class _IconLoader(QThread):
@@ -89,6 +89,10 @@ class ImageListWidget(QListWidget):
         self.setIconSize(QSize(self.ICON_W, self.ICON_H))
         self.setMouseTracking(True)
 
+        pix = QPixmap(self.ICON_W, self.ICON_H)
+        pix.fill(QColor(50, 52, 58))
+        self._placeholder_icon = QIcon(pix)
+
         # Floating preview label (ToolTip window type stays above everything)
         self._preview_lbl = QLabel()
         self._preview_lbl.setWindowFlags(
@@ -116,6 +120,11 @@ class ImageListWidget(QListWidget):
 
         if not paths:
             return
+
+        for i in range(self.count()):
+            item = self.item(i)
+            if item:
+                item.setIcon(self._placeholder_icon)
 
         self._icon_loader = self._make_icon_loader()
         self._icon_loader.icon_ready.connect(self._on_icon_ready)

@@ -169,6 +169,12 @@ QCheckBox#auto-advance-cb {{
     color: {TEXT_DIM};
 }}
 
+QCheckBox#move-enabled-cb {{
+    background: transparent;
+    font-size: 12px;
+    color: {TEXT_DIM};
+}}
+
 /* ── Assign row ─────────────────────────────────────────── */
 #assign-row {{
     background: {BG};
