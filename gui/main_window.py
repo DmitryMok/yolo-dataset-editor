@@ -1,0 +1,1582 @@
+import os
+import shutil
+import json
+from collections import deque
+from enum import Enum
+from pathlib import Path
+from typing import List
+
+from PyQt6.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
+    QListWidget, QLabel, QComboBox, QPushButton, QCheckBox,
+    QFileDialog, QMessageBox, QListWidgetItem,
+    QToolButton, QMenu, QGroupBox, QDialog, QDialogButtonBox,
+    QFormLayout, QSlider, QSizePolicy, QButtonGroup, QStyle,
+    QApplication,
+)
+from PyQt6.QtCore import Qt, QTimer, QRectF, QPoint, QPointF, QEvent, QSize
+from PyQt6.QtGui import (QAction, QKeySequence, QShortcut, QColor,
+                          QIcon, QPixmap, QImage, QTransform, QCursor)
+
+from core.config_io import DatasetConfig
+from core.annotation_io import load_annotations, save_annotations, get_images, get_label_path
+from core.image_ops import recalc_annotations_crop, recalc_annotations_rotate
+from gui.editor.viewer import ImageViewer
+from gui.editor.items import BBoxItem, SegmentItem, class_color, set_label_px
+from gui.editor.image_list_widget import ImageListWidget
+from gui.style import SPLIT_COLORS
+
+# ─── SVG icon helpers ─────────────────────────────────────────────────────────
+
+try:
+    from PyQt6.QtSvg import QSvgRenderer as _QSvgRenderer
+    _SVG_OK = True
+except ImportError:
+    _SVG_OK = False
+
+_ICON_PATHS = {
+    "folder": ("M3 6.5A1.5 1.5 0 0 1 4.5 5H8l1.5 1.8H19.5A1.5 1.5 0 0 1 21 8.3"
+               "v9.2A1.5 1.5 0 0 1 19.5 19h-15A1.5 1.5 0 0 1 3 17.5z"),
+    "save":   "M5 4h11l3 3v13H5zM9 4v5h6V4M8 14h8v6H8z",
+    "undo":   "M9 7L4 12l5 5M4 12h11a5 5 0 0 1 0 10h-2",
+    "redo":   "M15 7l5 5-5 5M20 12H9a5 5 0 0 0 0 10h2",
+    "gear":   ("M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6zM12 2l1.5 2.5 2.8-.6.6 2.8"
+               "L20 9l-1.6 2.4L20 14l-3.1 1.3-.6 2.8-2.8-.6L12 20l-1.5-2.1"
+               "-2.8.6-.6-2.8L4 14l1.6-2L4 9l3.1-1.3.6-2.8 2.8.6z"),
+    "trash":  "M3 6h18M8 6V4h8v2M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M10 11v6M14 11v6",
+}
+
+
+def _svg_icon(name: str, size: int = 16, color: str = "#c2c4c9") -> "QIcon | None":
+    """Create a QIcon from a design-spec SVG path (returns None if QtSvg unavailable)."""
+    if not _SVG_OK:
+        return None
+    from PyQt6.QtCore import QByteArray
+    from PyQt6.QtGui import QPainter
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" '
+        f'viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="1.7" '
+        f'stroke-linecap="round" stroke-linejoin="round">'
+        f'<path d="{_ICON_PATHS.get(name, "")}"/></svg>'
+    )
+    renderer = _QSvgRenderer(QByteArray(svg.encode("utf-8")))
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pix)
+    renderer.render(painter)
+    painter.end()
+    return QIcon(pix)
+
+
+HISTORY_FILE   = Path.home() / '.yololabel_history.json'
+HISTORY_LIMIT  = 10
+SETTINGS_FILE  = Path.home() / '.yololabel_settings.json'
+PROGRESS_FILE  = Path.home() / '.yololabel_progress.json'
+
+
+class ImgStatus(Enum):
+    UNVIEWED = "unviewed"
+    VIEWED   = "viewed"
+    SAVED    = "saved"
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, current: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setModal(True)
+        self.setFixedSize(320, 220)
+        layout = QVBoxLayout(self)
+
+        mouse_group = QGroupBox("Mouse buttons")
+        mg = QFormLayout(mouse_group)
+        self._pan_combo = QComboBox()
+        self._pan_combo.addItems(["Right button", "Middle button"])
+        self._pan_combo.setCurrentIndex(0 if current.get("pan_button","right") == "right" else 1)
+        mg.addRow("Pan image:", self._pan_combo)
+        self._fit_combo = QComboBox()
+        self._fit_combo.addItems(["Middle button", "Right button"])
+        self._fit_combo.setCurrentIndex(0 if current.get("fit_button","middle") == "middle" else 1)
+        mg.addRow("Fit to view:", self._fit_combo)
+        layout.addWidget(mouse_group)
+
+        edit_group = QGroupBox("Editing")
+        eg = QFormLayout(edit_group)
+        self._confirm_del_cb = QCheckBox()
+        self._confirm_del_cb.setChecked(current.get("confirm_delete", True))
+        eg.addRow("Confirm file delete:", self._confirm_del_cb)
+        layout.addWidget(edit_group)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def get_settings(self) -> dict:
+        return {
+            "pan_button": "right" if self._pan_combo.currentIndex() == 0 else "middle",
+            "fit_button": "middle" if self._fit_combo.currentIndex() == 0 else "right",
+            "confirm_delete": self._confirm_del_cb.isChecked(),
+        }
+
+
+def _color_icon(color: QColor, size: int = 14) -> QIcon:
+    pix = QPixmap(size, size)
+    pix.fill(color)
+    return QIcon(pix)
+
+
+# ─── Main window ──────────────────────────────────────────────────────────────
+
+class MainWindow(QMainWindow):
+    UNDO_LIMIT = 60
+
+    def __init__(self):
+        super().__init__()
+        self._config: DatasetConfig | None = None
+        self._images: List[Path] = []
+        self._current_idx = -1
+        self._dirty = False
+        self._navigating = False
+        self._updating_ui = False
+        self._ann_items: List = []
+
+        self._pending_image: QImage | None = None
+        self._current_browse_split = ""
+        self._confirm_delete = True
+
+        self._undo_stack: deque = deque(maxlen=self.UNDO_LIMIT)
+        self._redo_stack: deque = deque(maxlen=self.UNDO_LIMIT)
+        self._pre_edit_state: list | None = None
+        self._in_undo = False
+
+        self._img_status: dict[str, ImgStatus] = {}
+        self._load_progress()
+
+        self._esc_pending = False
+        self._esc_timer = QTimer(self)
+        self._esc_timer.setSingleShot(True)
+        self._esc_timer.setInterval(400)
+        self._esc_timer.timeout.connect(lambda: setattr(self, '_esc_pending', False))
+
+        self._load_settings()
+        self._setup_ui()
+        self._setup_shortcuts()
+        self._apply_mouse_settings()
+        self.setWindowTitle("YOLO Annotator")
+        self.resize(1440, 920)
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _setup_ui(self):
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(self._make_left_panel())
+        splitter.addWidget(self._build_center_widget())
+        splitter.addWidget(self._make_right_panel())
+        splitter.setSizes([262, 900, 290])
+        splitter.setStretchFactor(1, 1)
+
+        container = QWidget()
+        vlay = QVBoxLayout(container)
+        vlay.setContentsMargins(0, 0, 0, 0)
+        vlay.setSpacing(0)
+        vlay.addWidget(self._build_toolbar_widget())
+        vlay.addWidget(splitter, 1)
+        self.setCentralWidget(container)
+
+        self._status_lbl = QLabel("Open a YAML config to begin")
+        self.statusBar().addWidget(self._status_lbl)
+
+    # ── Toolbar ───────────────────────────────────────────────────────────────
+
+    def _build_toolbar_widget(self) -> QWidget:
+        app_style = QApplication.instance().style()
+        # Resolve icons: SVG from design spec, fall back to Qt standard
+        ic_folder = (_svg_icon("folder") or
+                     app_style.standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon))
+        ic_undo   = _svg_icon("undo")
+        ic_redo   = _svg_icon("redo")
+        ic_gear   = _svg_icon("gear")
+
+        tb = QWidget()
+        tb.setObjectName("toolbar")
+        tb.setFixedHeight(34)
+        lay = QHBoxLayout(tb)
+        lay.setContentsMargins(8, 4, 8, 4)
+        lay.setSpacing(0)
+
+        # ── Zone 1: Mode tabs ─────────────────────────────────────────────────
+        mode_bg = QWidget()
+        mode_bg.setObjectName("modetabs-bg")
+        mode_bg.setFixedHeight(26)
+        mode_lay = QHBoxLayout(mode_bg)
+        mode_lay.setContentsMargins(2, 2, 2, 2)
+        mode_lay.setSpacing(2)
+
+        self._mode_annotate = QPushButton("Разметка")
+        self._mode_annotate.setObjectName("modetab")
+        self._mode_annotate.setCheckable(True)
+        self._mode_annotate.setChecked(True)
+        self._mode_annotate.setFixedHeight(22)
+        self._mode_annotate.setToolTip("Режим разметки изображений")
+
+        self._mode_dataset = QPushButton("Датасет")
+        self._mode_dataset.setObjectName("modetab")
+        self._mode_dataset.setCheckable(True)
+        self._mode_dataset.setFixedHeight(22)
+        self._mode_dataset.setToolTip("Анализ датасета (будет добавлено)")
+
+        mode_group = QButtonGroup(tb)
+        mode_group.setExclusive(True)
+        mode_group.addButton(self._mode_annotate)
+        mode_group.addButton(self._mode_dataset)
+
+        mode_lay.addWidget(self._mode_annotate)
+        mode_lay.addWidget(self._mode_dataset)
+
+        lay.addWidget(mode_bg, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addWidget(self._make_sep())
+
+        # ── Zone 2: File actions ───────────────────────────────────────────────
+        z2 = QWidget()
+        z2.setObjectName("tzone")
+        z2l = QHBoxLayout(z2)
+        z2l.setContentsMargins(8, 0, 8, 0)
+        z2l.setSpacing(4)
+
+        self._open_btn = QToolButton(self)
+        self._open_btn.setIcon(ic_folder)
+        self._open_btn.setIconSize(QSize(16, 16))
+        self._open_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self._open_btn.setObjectName("tbtn")
+        # Width = left-pad(8) + icon(16) + gap(6) + menu-indicator(14) = 44px
+        # Override right padding so the icon doesn't bleed into the arrow area
+        self._open_btn.setFixedSize(44, 24)
+        self._open_btn.setStyleSheet(
+            "QToolButton#tbtn { padding: 0 14px 0 5px; }"
+        )
+        self._open_btn.setPopupMode(
+            QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self._open_btn.setToolTip(
+            "Открыть конфиг датасета\n▾ — история последних конфигов")
+        self._open_menu = QMenu(self)
+        self._open_btn.setMenu(self._open_menu)
+        self._open_btn.clicked.connect(self._open_new_config)
+        self._populate_open_menu()
+
+        self._undo_btn = QToolButton(self)
+        if ic_undo:
+            self._undo_btn.setIcon(ic_undo)
+            self._undo_btn.setIconSize(QSize(16, 16))
+            self._undo_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        else:
+            self._undo_btn.setText("↩")
+        self._undo_btn.setObjectName("tbtn")
+        self._undo_btn.setFixedSize(26, 24)
+        self._undo_btn.setToolTip("Отменить последнее действие (Ctrl+Z)")
+        self._undo_btn.clicked.connect(self._undo)
+        self._undo_btn.setEnabled(False)
+
+        self._redo_btn = QToolButton(self)
+        if ic_redo:
+            self._redo_btn.setIcon(ic_redo)
+            self._redo_btn.setIconSize(QSize(16, 16))
+            self._redo_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        else:
+            self._redo_btn.setText("↪")
+        self._redo_btn.setObjectName("tbtn")
+        self._redo_btn.setFixedSize(26, 24)
+        self._redo_btn.setToolTip("Повторить отменённое действие (Ctrl+Y)")
+        self._redo_btn.clicked.connect(self._redo)
+        self._redo_btn.setEnabled(False)
+
+        z2l.addWidget(self._open_btn)
+        z2l.addWidget(self._undo_btn)
+        z2l.addWidget(self._redo_btn)
+
+        lay.addWidget(z2, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        lay.addStretch()
+        lay.addWidget(self._make_sep())
+
+        # ── Zone 3: Status ─────────────────────────────────────────────────────
+        z3 = QWidget()
+        z3.setObjectName("tzone")
+        z3l = QHBoxLayout(z3)
+        z3l.setContentsMargins(8, 0, 12, 0)
+        z3l.setSpacing(10)
+
+        self._autosave_cb = QCheckBox("Autosave")
+        self._autosave_cb.setFixedHeight(22)
+        self._autosave_cb.setToolTip(
+            "Автоматически сохранять при переходе между изображениями")
+
+        self._settings_btn = QToolButton(self)
+        if ic_gear:
+            self._settings_btn.setIcon(ic_gear)
+            self._settings_btn.setIconSize(QSize(16, 16))
+            self._settings_btn.setToolButtonStyle(
+                Qt.ToolButtonStyle.ToolButtonIconOnly)
+        else:
+            self._settings_btn.setText("⚙")
+        self._settings_btn.setObjectName("tbtn")
+        self._settings_btn.setFixedSize(26, 24)
+        self._settings_btn.setToolTip("Настройки (кнопки мыши и пр.)")
+        self._settings_btn.clicked.connect(self._open_settings)
+
+        z3l.addWidget(self._autosave_cb)
+        z3l.addWidget(self._settings_btn)
+
+        lay.addWidget(z3, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        return tb
+
+    def _make_sep(self) -> QWidget:
+        sep = QWidget()
+        sep.setObjectName("zone-sep")
+        sep.setFixedWidth(1)
+        sep.setFixedHeight(18)
+        return sep
+
+    # ── Center widget ─────────────────────────────────────────────────────────
+
+    def _build_center_widget(self) -> QWidget:
+        center = QWidget()
+        vlay = QVBoxLayout(center)
+        vlay.setContentsMargins(0, 0, 0, 0)
+        vlay.setSpacing(0)
+
+        vlay.addWidget(self._build_canvas_nav_bar())
+        vlay.addWidget(self._build_assign_row())
+
+        self._viewer = ImageViewer()
+        self._viewer.viewport().installEventFilter(self)
+        self._viewer.annotation_changed.connect(self._on_annotation_changed)
+        self._viewer.annotation_added.connect(self._on_annotation_added)
+        self._viewer.pre_edit_started.connect(self._on_pre_edit_started)
+        self._viewer.label_size_changed.connect(self._on_label_size_changed)
+        self._viewer.crop_confirmed.connect(self._on_crop_confirmed)
+        self._viewer.crop_cancelled.connect(self._on_crop_cancelled)
+        self._viewer.segment_convert_requested.connect(self._on_segment_double_click)
+        self._viewer.scene().selectionChanged.connect(self._on_scene_selection_changed)
+
+        vlay.addWidget(self._viewer, 1)
+        return center
+
+    def _build_canvas_nav_bar(self) -> QWidget:
+        nav = QWidget()
+        nav.setObjectName("canvas-nav")
+        nav.setFixedHeight(30)
+        lay = QHBoxLayout(nav)
+        lay.setContentsMargins(12, 2, 12, 2)
+        lay.setSpacing(6)
+
+        self._nav_prev = QPushButton("‹")
+        self._nav_prev.setObjectName("nav-btn")
+        self._nav_prev.setFixedSize(28, 24)
+        self._nav_prev.setToolTip("Предыдущее изображение (←)")
+        self._nav_prev.clicked.connect(self._prev_image)
+
+        self._nav_counter = QLabel("–")
+        self._nav_counter.setObjectName("nav-counter")
+        self._nav_counter.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._nav_counter.setMinimumWidth(52)
+
+        self._nav_next = QPushButton("›")
+        self._nav_next.setObjectName("nav-btn")
+        self._nav_next.setFixedSize(28, 24)
+        self._nav_next.setToolTip("Следующее изображение (→)")
+        self._nav_next.clicked.connect(self._next_image)
+
+        lay.addWidget(self._nav_prev, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addWidget(self._nav_counter, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addWidget(self._nav_next, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addStretch()
+
+        self._auto_advance_cb = QCheckBox("Авто-переход")
+        self._auto_advance_cb.setObjectName("auto-advance-cb")
+        self._auto_advance_cb.setToolTip(
+            "После назначения сплита (1/2/3) автоматически перейти к следующему изображению")
+        lay.addWidget(self._auto_advance_cb)
+
+        return nav
+
+    def _build_assign_row(self) -> QWidget:
+        row = QWidget()
+        row.setObjectName("assign-row")
+        row.setFixedHeight(36)
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(12, 0, 12, 0)
+        lay.setSpacing(8)
+
+        lbl = QLabel("SPLIT:")
+        lbl.setObjectName("assign-lbl")
+        lay.addWidget(lbl)
+
+        seg_bg = QWidget()
+        seg_bg.setObjectName("seg-bg")
+        seg_lay = QHBoxLayout(seg_bg)
+        seg_lay.setContentsMargins(2, 2, 2, 2)
+        seg_lay.setSpacing(2)
+
+        self._split_btns: dict[str, QPushButton] = {}
+        _split_tips = {
+            "train": "Переместить изображение в сплит Train [1]",
+            "val":   "Переместить изображение в сплит Val [2]",
+            "test":  "Переместить изображение в сплит Test [3]",
+        }
+        for name, hotkey in [("Train", "1"), ("Val", "2"), ("Test", "3")]:
+            btn = QPushButton(f"● {name}  {hotkey}")
+            btn.setObjectName("split-btn")
+            btn.setProperty("split", name.lower())
+            btn.setCheckable(True)
+            btn.setFixedHeight(24)
+            btn.setToolTip(_split_tips[name.lower()])
+            btn.clicked.connect(
+                lambda _checked, s=name.lower(): self._on_assign_split(s))
+            seg_lay.addWidget(btn)
+            self._split_btns[name.lower()] = btn
+
+        lay.addWidget(seg_bg)
+
+        self._defer_btn = QPushButton("⚡ Отложить  4")
+        self._defer_btn.setObjectName("split-btn")
+        self._defer_btn.setProperty("split", "review")
+        self._defer_btn.setCheckable(True)
+        self._defer_btn.setFixedHeight(24)
+        self._defer_btn.setToolTip(
+            "Отложить изображение в Review-папку [4]\n"
+            "Папка review/ создаётся автоматически при первом использовании")
+        self._split_btns["review"] = self._defer_btn
+        lay.addWidget(self._defer_btn)
+
+        lay.addStretch()
+
+        cur_lbl = QLabel("текущий:")
+        cur_lbl.setObjectName("cur-lbl")
+
+        # Badge — clickable, opens browse-split popup menu
+        self._split_badge_btn = QToolButton()
+        self._split_badge_btn.setObjectName("split-badge-btn")
+        self._split_badge_btn.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._split_badge_btn.setToolTip(
+            "Текущий просматриваемый сплит\nНажмите для переключения")
+        self._split_badge_btn.setFixedHeight(22)
+        self._split_badge_menu = QMenu(self)
+        self._split_badge_menu.aboutToShow.connect(self._rebuild_badge_menu)
+        self._split_badge_btn.setMenu(self._split_badge_menu)
+
+        cur_block = QWidget()
+        cur_block.setObjectName("cur-block")
+        cur_block.setFixedWidth(130)
+        cbl = QHBoxLayout(cur_block)
+        cbl.setContentsMargins(0, 0, 0, 0)
+        cbl.setSpacing(4)
+        cbl.addWidget(cur_lbl)
+        cbl.addWidget(self._split_badge_btn, 1)
+        lay.addWidget(cur_block)
+
+        return row
+
+    # ── Left / right panels ───────────────────────────────────────────────────
+
+    def _make_left_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setObjectName("panel-left")
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        header_row = QWidget()
+        header_row.setObjectName("panel-header-row")
+        hr_lay = QHBoxLayout(header_row)
+        hr_lay.setContentsMargins(12, 6, 4, 6)
+        hr_lay.setSpacing(4)
+
+        header = QLabel("ИЗОБРАЖЕНИЯ")
+        header.setObjectName("phead")
+        hr_lay.addWidget(header)
+        hr_lay.addStretch()
+
+        _app_style = QApplication.instance().style()
+        _ic_save  = (_svg_icon("save") or
+                     _app_style.standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
+        _ic_trash = _svg_icon("trash")
+
+        self._save_btn = QToolButton(self)
+        self._save_btn.setIcon(_ic_save)
+        self._save_btn.setIconSize(QSize(16, 16))
+        self._save_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self._save_btn.setObjectName("panel-head-btn")
+        self._save_btn.setFixedSize(24, 22)
+        self._save_btn.setToolTip("Сохранить аннотации (Ctrl+S)")
+        self._save_btn.clicked.connect(self._on_save)
+        self._save_btn.setEnabled(False)
+
+        self._del_file_btn = QToolButton(self)
+        if _ic_trash:
+            self._del_file_btn.setIcon(_ic_trash)
+            self._del_file_btn.setIconSize(QSize(16, 16))
+            self._del_file_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        else:
+            self._del_file_btn.setText("🗑")
+        self._del_file_btn.setObjectName("panel-head-btn-danger")
+        self._del_file_btn.setFixedSize(24, 22)
+        self._del_file_btn.setToolTip("Удалить текущий файл [D]")
+        self._del_file_btn.clicked.connect(self._delete_current_file)
+        self._del_file_btn.setEnabled(False)
+
+        hr_lay.addWidget(self._save_btn)
+        hr_lay.addWidget(self._del_file_btn)
+        lay.addWidget(header_row)
+
+        self._image_list = ImageListWidget()
+        self._image_list.currentRowChanged.connect(self._on_image_list_row_changed)
+        self._image_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._image_list.customContextMenuRequested.connect(
+            self._on_image_list_context_menu)
+        lay.addWidget(self._image_list)
+
+        panel.setMinimumWidth(170)
+        panel.setMaximumWidth(320)
+        return panel
+
+    def _make_right_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setObjectName("panel-right")
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(6)
+
+        ann_group = QGroupBox("Annotations")
+        ag = QVBoxLayout(ann_group)
+        ag.setContentsMargins(4, 6, 4, 4)
+        ag.setSpacing(4)
+
+        self._draw_btn = QPushButton("✏ Draw BBox")
+        self._draw_btn.setCheckable(True)
+        self._draw_btn.setToolTip("Нарисовать bounding box [Пробел]")
+        self._draw_btn.toggled.connect(self._on_draw_mode_toggled)
+        ag.addWidget(self._draw_btn)
+
+        self._ann_list = QListWidget()
+        self._ann_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self._ann_list.itemSelectionChanged.connect(self._on_ann_list_selection_changed)
+        self._ann_list.itemDoubleClicked.connect(self._on_ann_list_double_click)
+        ag.addWidget(self._ann_list)
+
+        ag.addWidget(QLabel("Class:"))
+        self._class_combo = QComboBox()
+        self._class_combo.currentIndexChanged.connect(self._on_class_combo_changed)
+        self._class_combo.setEnabled(False)
+        ag.addWidget(self._class_combo)
+
+        self._convert_btn = QPushButton("Convert → BBox")
+        self._convert_btn.setToolTip("Конвертировать выбранные сегментации в bbox")
+        self._convert_btn.clicked.connect(self._on_convert_to_bbox)
+        self._convert_btn.setEnabled(False)
+        ag.addWidget(self._convert_btn)
+
+        self._delete_btn = QPushButton("Delete Annotation(s)")
+        self._delete_btn.setObjectName("danger-btn")
+        self._delete_btn.setToolTip("Удалить выбранные рамки / сегментации [Del]")
+        self._delete_btn.clicked.connect(self._on_delete)
+        self._delete_btn.setEnabled(False)
+        ag.addWidget(self._delete_btn)
+
+        lay.addWidget(ann_group, 1)
+
+        img_group = QGroupBox("Image")
+        ig = QVBoxLayout(img_group)
+        ig.setContentsMargins(4, 6, 4, 4)
+        ig.setSpacing(4)
+
+        self._crop_btn = QPushButton("✂ Crop  [X]")
+        self._crop_btn.setCheckable(True)
+        self._crop_btn.setToolTip("Режим кадрирования [X]")
+        self._crop_btn.toggled.connect(self._on_crop_btn)
+        ig.addWidget(self._crop_btn)
+
+        rot_row = QWidget()
+        rot_lay = QHBoxLayout(rot_row)
+        rot_lay.setContentsMargins(0, 0, 0, 0)
+        rot_lay.setSpacing(4)
+        btn_cw = QPushButton("↻ CW  [R]")
+        btn_cw.setToolTip("Повернуть по часовой стрелке [R]")
+        btn_cw.clicked.connect(lambda: self._rotate_image(clockwise=True))
+        btn_ccw = QPushButton("↺ CCW  [⇧R]")
+        btn_ccw.setToolTip("Повернуть против часовой стрелки [Shift+R]")
+        btn_ccw.clicked.connect(lambda: self._rotate_image(clockwise=False))
+        rot_lay.addWidget(btn_cw)
+        rot_lay.addWidget(btn_ccw)
+        ig.addWidget(rot_row)
+
+        def _slider_row(label: str) -> tuple:
+            row = QWidget()
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(4)
+            lbl = QLabel(label)
+            lbl.setFixedWidth(12)
+            sl = QSlider(Qt.Orientation.Horizontal)
+            sl.setRange(-100, 100)
+            sl.setValue(0)
+            sl.setTickInterval(50)
+            val_lbl = QLabel("0")
+            val_lbl.setFixedWidth(28)
+            val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            rl.addWidget(lbl)
+            rl.addWidget(sl)
+            rl.addWidget(val_lbl)
+            return row, sl, val_lbl
+
+        bright_row, self._bright_sl, self._bright_val = _slider_row("B")
+        contr_row,  self._contr_sl,  self._contr_val  = _slider_row("C")
+        self._bright_sl.valueChanged.connect(self._on_bc_changed)
+        self._contr_sl.valueChanged.connect(self._on_bc_changed)
+        self._bright_sl.valueChanged.connect(
+            lambda v: self._bright_val.setText(str(v)))
+        self._contr_sl.valueChanged.connect(
+            lambda v: self._contr_val.setText(str(v)))
+
+        def _add_snap(sl: QSlider):
+            def _snap():
+                if 0 < abs(sl.value()) <= 2:
+                    sl.setValue(0)
+            sl.sliderReleased.connect(_snap)
+        _add_snap(self._bright_sl)
+        _add_snap(self._contr_sl)
+
+        ig.addWidget(bright_row)
+        ig.addWidget(contr_row)
+
+        lay.addWidget(img_group, 0)
+
+        panel.setMinimumWidth(170)
+        panel.setMaximumWidth(320)
+        return panel
+
+    # ── Shortcuts ─────────────────────────────────────────────────────────────
+
+    def _setup_shortcuts(self):
+        QShortcut(QKeySequence.StandardKey.Save,  self, self._on_save)
+        QShortcut(QKeySequence.StandardKey.Undo,  self, self._undo)
+        QShortcut(QKeySequence.StandardKey.Redo,  self, self._redo)
+        QShortcut(QKeySequence(Qt.Key.Key_Delete), self, self._on_delete)
+        QShortcut(QKeySequence(Qt.Key.Key_Space),  self, self._toggle_draw_mode)
+        QShortcut(QKeySequence(Qt.Key.Key_D),      self, self._delete_current_file)
+        QShortcut(QKeySequence("X"),               self, self._toggle_crop_mode)
+        QShortcut(QKeySequence("R"),               self, lambda: self._rotate_image(clockwise=True))
+        QShortcut(QKeySequence("Shift+R"),         self, lambda: self._rotate_image(clockwise=False))
+        QShortcut(QKeySequence("Ctrl+A"),          self, self._select_all_annotations)
+        QShortcut(QKeySequence("1"), self, lambda: self._on_assign_split("train"))
+        QShortcut(QKeySequence("2"), self, lambda: self._on_assign_split("val"))
+        QShortcut(QKeySequence("3"), self, lambda: self._on_assign_split("test"))
+        QShortcut(QKeySequence("4"), self, lambda: self._on_assign_split("review"))
+
+    def keyPressEvent(self, event):
+        key = event.key()
+
+        if key == Qt.Key.Key_Escape:
+            if self._esc_pending:
+                self._esc_timer.stop()
+                self._esc_pending = False
+                self._on_double_esc()
+            else:
+                self._esc_pending = True
+                self._esc_timer.start()
+            super().keyPressEvent(event)
+            return
+
+        if key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down):
+            selected = [i for i in self._viewer.scene().selectedItems()
+                        if isinstance(i, (BBoxItem, SegmentItem))]
+            if selected:
+                step = 10 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
+                dx = step if key == Qt.Key.Key_Right else (-step if key == Qt.Key.Key_Left else 0)
+                dy = step if key == Qt.Key.Key_Down  else (-step if key == Qt.Key.Key_Up   else 0)
+                self._move_selected_items(dx, dy)
+                return
+            else:
+                if key == Qt.Key.Key_Right:
+                    self._next_image()
+                elif key == Qt.Key.Key_Left:
+                    self._prev_image()
+                return
+
+        super().keyPressEvent(event)
+
+    def eventFilter(self, obj, event):
+        if obj is self._viewer.viewport() and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            if key in (Qt.Key.Key_Left, Qt.Key.Key_Right,
+                       Qt.Key.Key_Up, Qt.Key.Key_Down):
+                selected = [i for i in self._viewer.scene().selectedItems()
+                            if isinstance(i, (BBoxItem, SegmentItem))]
+                if selected:
+                    step = 10 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
+                    dx = step if key == Qt.Key.Key_Right else (-step if key == Qt.Key.Key_Left else 0)
+                    dy = step if key == Qt.Key.Key_Down  else (-step if key == Qt.Key.Key_Up   else 0)
+                    self._move_selected_items(dx, dy)
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _move_selected_items(self, dx: int, dy: int):
+        selected = [i for i in self._viewer.scene().selectedItems()
+                    if isinstance(i, (BBoxItem, SegmentItem))]
+        if not selected:
+            return
+        self._capture_for_undo()
+        for item in selected:
+            if isinstance(item, BBoxItem):
+                r = item.rect()
+                bw, bh = float(item._bnd_w), float(item._bnd_h)
+                x1 = max(0.0, min(bw - r.width(),  r.left() + dx)) if bw else r.left() + dx
+                y1 = max(0.0, min(bh - r.height(), r.top()  + dy)) if bh else r.top()  + dy
+                item.set_rect(QRectF(x1, y1, r.width(), r.height()))
+            elif isinstance(item, SegmentItem):
+                bw, bh = float(item._bnd_w), float(item._bnd_h)
+                pts = item.points()
+                new_pts = []
+                for p in pts:
+                    nx = max(0.0, min(bw, p.x() + dx)) if bw else p.x() + dx
+                    ny = max(0.0, min(bh, p.y() + dy)) if bh else p.y() + dy
+                    new_pts.append(QPointF(nx, ny))
+                item._pts = new_pts
+                item.prepareGeometryChange()
+                for i, h in enumerate(item._vhandles):
+                    h.setPos(new_pts[i])
+                item.update()
+        self._viewer.annotation_changed.emit()
+
+    # ── Settings ──────────────────────────────────────────────────────────────
+
+    def _load_settings(self):
+        try:
+            d = json.loads(SETTINGS_FILE.read_text())
+            set_label_px(d.get('label_px', 12))
+            self._confirm_delete = d.get("confirm_delete", True)
+            self._mouse_settings = {
+                "pan_button": d.get("pan_button", "right"),
+                "fit_button": d.get("fit_button", "middle"),
+            }
+        except Exception:
+            self._mouse_settings = {"pan_button": "right", "fit_button": "middle"}
+
+    def _apply_mouse_settings(self):
+        self._viewer.set_mouse_buttons(
+            self._mouse_settings["pan_button"],
+            self._mouse_settings["fit_button"])
+
+    def _open_settings(self):
+        current = {**self._mouse_settings, "confirm_delete": self._confirm_delete}
+        dlg = SettingsDialog(current, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new = dlg.get_settings()
+            self._confirm_delete = new.pop("confirm_delete", True)
+            self._mouse_settings.update(new)
+            self._apply_mouse_settings()
+            self._save_settings()
+
+    def _save_settings(self):
+        try:
+            try:
+                d = json.loads(SETTINGS_FILE.read_text())
+            except Exception:
+                d = {}
+            d.update(self._mouse_settings)
+            d["confirm_delete"] = self._confirm_delete
+            SETTINGS_FILE.write_text(json.dumps(d))
+        except Exception:
+            pass
+
+    def _on_label_size_changed(self, px: int):
+        try:
+            try:
+                d = json.loads(SETTINGS_FILE.read_text())
+            except Exception:
+                d = {}
+            d['label_px'] = px
+            SETTINGS_FILE.write_text(json.dumps(d))
+        except Exception:
+            pass
+
+    # ── Config history ────────────────────────────────────────────────────────
+
+    def _load_history(self) -> list:
+        try:
+            return json.loads(HISTORY_FILE.read_text())
+        except Exception:
+            return []
+
+    def _save_history(self, path_str: str):
+        hist = [p for p in self._load_history() if p != path_str]
+        hist.insert(0, path_str)
+        try:
+            HISTORY_FILE.write_text(json.dumps(hist[:HISTORY_LIMIT]))
+        except Exception:
+            pass
+        self._populate_open_menu()
+
+    def _populate_open_menu(self):
+        self._open_menu.clear()
+        act_new = QAction("Open new…", self)
+        act_new.triggered.connect(self._open_new_config)
+        self._open_menu.addAction(act_new)
+        hist = self._load_history()
+        if hist:
+            self._open_menu.addSeparator()
+            for p in hist:
+                act = QAction(p, self)
+                act.triggered.connect(
+                    lambda checked, _p=p: self._load_config_from_path(_p))
+                self._open_menu.addAction(act)
+
+    def _open_new_config(self):
+        start_dir = ""
+        hist = self._load_history()
+        if hist:
+            parent = Path(hist[0]).parent
+            if parent.exists():
+                start_dir = str(parent)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open YAML Config", start_dir,
+            "YAML files (*.yaml *.yml);;All files (*)")
+        if path:
+            self._load_config_from_path(path)
+
+    def _load_config_from_path(self, path: str):
+        try:
+            self._config = DatasetConfig(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to parse config:\n{e}")
+            return
+        self._save_history(path)
+
+        self._class_combo.clear()
+        for cid, name in enumerate(self._config.names):
+            self._class_combo.addItem(_color_icon(class_color(cid)), name)
+
+        if self._config.splits:
+            first = next(iter(self._config.splits))
+            self._current_browse_split = first
+            self._load_split(first)
+        else:
+            QMessageBox.warning(self, "Warning",
+                                "No valid split folders found next to the config.")
+
+    # ── Split browsing ────────────────────────────────────────────────────────
+
+    def _switch_browse_split(self, split: str):
+        if not self._config or split not in self._config.splits:
+            return
+        if self._dirty:
+            if not self._maybe_save():
+                return
+        self._current_browse_split = split
+        self._load_split(split)
+
+    def _rebuild_badge_menu(self):
+        self._split_badge_menu.clear()
+        if not self._config:
+            return
+        _order = ["train", "val", "test", "review"]
+        shown = set(_order)
+        for split in _order:
+            split_dir = self._config.splits.get(split)
+            if split_dir is not None:
+                try:
+                    imgs = get_images(split_dir) if split_dir.exists() else []
+                    count = len(imgs)
+                except Exception:
+                    count = 0
+                act = QAction(f"{split}  ({count} фото)", self)
+                act.triggered.connect(
+                    lambda _, s=split: self._switch_browse_split(s))
+            else:
+                act = QAction(f"{split}  (–)", self)
+                act.setEnabled(False)
+            self._split_badge_menu.addAction(act)
+        for split, split_dir in self._config.splits.items():
+            if split not in shown:
+                try:
+                    imgs = get_images(split_dir) if split_dir.exists() else []
+                    count = len(imgs)
+                except Exception:
+                    count = 0
+                act = QAction(f"{split}  ({count} фото)", self)
+                act.triggered.connect(
+                    lambda _, s=split: self._switch_browse_split(s))
+                self._split_badge_menu.addAction(act)
+
+    def _load_split(self, split: str):
+        if not self._config or split not in self._config.splits:
+            return
+        self._images = get_images(self._config.splits[split])
+        self._current_idx = -1
+        self._dirty = False
+        self._clear_undo()
+
+        self._image_list.blockSignals(True)
+        self._image_list.clear()
+        for img in self._images:
+            self._image_list.addItem(img.name)
+        self._image_list.blockSignals(False)
+        self._image_list.set_paths(self._images)
+        for i in range(len(self._images)):
+            self._apply_status_color(i)
+
+        self._viewer.scene().clear()
+        self._ann_items = []
+        self._ann_list.clear()
+        self._save_btn.setEnabled(False)
+        self._del_file_btn.setEnabled(False)
+        self._update_status()
+        self._update_assign_row()
+
+        if self._images:
+            self._navigate_to(0)
+
+    # ── Navigation ────────────────────────────────────────────────────────────
+
+    def _next_image(self):
+        self._navigate_to(self._current_idx + 1)
+
+    def _prev_image(self):
+        self._navigate_to(self._current_idx - 1)
+
+    def _on_image_list_row_changed(self, row: int):
+        if self._navigating or row < 0 or row == self._current_idx:
+            return
+        self._navigate_to(row)
+
+    def _navigate_to(self, idx: int):
+        if not self._images:
+            return
+        idx = max(0, min(len(self._images) - 1, idx))
+        if idx == self._current_idx:
+            return
+
+        if self._dirty:
+            if self._autosave_cb.isChecked():
+                self._save_current()
+            elif not self._maybe_save():
+                self._navigating = True
+                self._image_list.setCurrentRow(self._current_idx)
+                self._navigating = False
+                return
+
+        self._current_idx = idx
+        self._navigating = True
+        self._image_list.setCurrentRow(idx)
+        self._navigating = False
+        self._load_current_image()
+
+    def _load_current_image(self):
+        if self._current_idx < 0 or not self._images:
+            return
+        self._pending_image = None
+        self._viewer.stop_crop_mode()
+        self._crop_btn.setChecked(False)
+        path = self._images[self._current_idx]
+        anns = load_annotations(path)
+        classes = self._config.names if self._config else []
+        self._viewer.load_image(path, anns, classes)
+        self._bright_sl.setValue(0)
+        self._contr_sl.setValue(0)
+        self._dirty = False
+        self._save_btn.setEnabled(True)
+        self._del_file_btn.setEnabled(True)
+        self._clear_undo()
+        self._rebuild_ann_list()
+        self._update_status()
+        self._update_assign_row()
+        if self._class_combo.count():
+            self._sync_viewer_class(self._class_combo.currentIndex())
+        if self._get_img_status(path) == ImgStatus.UNVIEWED:
+            self._set_img_status(path, ImgStatus.VIEWED)
+
+    # ── Save ──────────────────────────────────────────────────────────────────
+
+    def _on_save(self):
+        self._save_current()
+
+    def _save_current(self):
+        if self._current_idx < 0 or not self._images:
+            return
+        path = self._images[self._current_idx]
+        if self._pending_image is not None:
+            self._pending_image.save(str(path))
+            self._pending_image = None
+        save_annotations(path, self._viewer.get_annotations())
+        self._dirty = False
+        self._viewer.scene().clearSelection()
+        self._set_img_status(path, ImgStatus.SAVED)
+        self._update_status()
+
+    def _maybe_save(self) -> bool:
+        reply = QMessageBox.question(
+            self, "Unsaved Changes", "Save changes to the current image?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No |
+            QMessageBox.StandardButton.Cancel)
+        if reply == QMessageBox.StandardButton.Cancel:
+            return False
+        if reply == QMessageBox.StandardButton.Yes:
+            self._save_current()
+        else:
+            self._dirty = False
+            self._pending_image = None
+        return True
+
+    # ── Undo / Redo ───────────────────────────────────────────────────────────
+
+    def _clear_undo(self):
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._pre_edit_state = None
+        self._undo_btn.setEnabled(False)
+        self._redo_btn.setEnabled(False)
+
+    def _on_pre_edit_started(self):
+        if not self._in_undo:
+            self._pre_edit_state = self._viewer.get_annotations()
+
+    def _push_undo(self, state: list):
+        self._undo_stack.append(state)
+        self._redo_stack.clear()
+        self._undo_btn.setEnabled(True)
+        self._redo_btn.setEnabled(False)
+
+    def _undo(self):
+        if not self._undo_stack:
+            return
+        self._redo_stack.append(self._viewer.get_annotations())
+        state = self._undo_stack.pop()
+        self._restore(state)
+        self._undo_btn.setEnabled(bool(self._undo_stack))
+        self._redo_btn.setEnabled(True)
+
+    def _redo(self):
+        if not self._redo_stack:
+            return
+        self._undo_stack.append(self._viewer.get_annotations())
+        state = self._redo_stack.pop()
+        self._restore(state)
+        self._undo_btn.setEnabled(True)
+        self._redo_btn.setEnabled(bool(self._redo_stack))
+
+    def _restore(self, state: list):
+        self._in_undo = True
+        classes = self._config.names if self._config else []
+        self._viewer.restore_annotations(state, classes)
+        self._in_undo = False
+        self._rebuild_ann_list()
+        self._dirty = True
+        self._save_btn.setEnabled(True)
+        self._update_status()
+
+    # ── Annotation list ───────────────────────────────────────────────────────
+
+    def _rebuild_ann_list(self, _=None):
+        self._updating_ui = True
+        self._ann_list.clear()
+        self._ann_items = []
+        seq = 1
+        for item in self._viewer.scene().items():
+            if not isinstance(item, (BBoxItem, SegmentItem)):
+                continue
+            kind = "BBox" if isinstance(item, BBoxItem) else "Seg"
+            lw = QListWidgetItem(_color_icon(item.color),
+                                 f"{seq}. {kind}: {item.class_name}")
+            self._ann_list.addItem(lw)
+            self._ann_items.append(item)
+            seq += 1
+        self._updating_ui = False
+
+    def _on_ann_list_selection_changed(self):
+        if self._updating_ui:
+            return
+        selected_rows = sorted(self._ann_list.row(i)
+                               for i in self._ann_list.selectedItems())
+        self._updating_ui = True
+        self._viewer.scene().clearSelection()
+        first_item = None
+        for row in selected_rows:
+            if row < len(self._ann_items):
+                self._ann_items[row].setSelected(True)
+                if first_item is None:
+                    first_item = self._ann_items[row]
+        self._updating_ui = False
+        if first_item is not None:
+            self._viewer.scroll_to_item(first_item)
+
+    def _on_scene_selection_changed(self):
+        if self._updating_ui:
+            return
+        selected = [i for i in self._viewer.scene().selectedItems()
+                    if isinstance(i, (BBoxItem, SegmentItem))]
+        has_sel = bool(selected)
+        has_seg = any(isinstance(i, SegmentItem) for i in selected)
+        self._delete_btn.setEnabled(has_sel)
+        self._convert_btn.setEnabled(has_seg)
+        self._class_combo.setEnabled(has_sel)
+
+        self._updating_ui = True
+        self._ann_list.clearSelection()
+        for item in selected:
+            if item in self._ann_items:
+                row = self._ann_items.index(item)
+                self._ann_list.item(row).setSelected(True)
+        if selected:
+            self._class_combo.setCurrentIndex(selected[0].class_id)
+        self._updating_ui = False
+
+    # ── Draw mode ─────────────────────────────────────────────────────────────
+
+    def _on_draw_mode_toggled(self, checked: bool):
+        self._viewer.set_draw_mode(checked)
+        self._draw_btn.setText("✏ Drawing…" if checked else "✏ Draw BBox")
+
+    def _toggle_draw_mode(self):
+        self._draw_btn.setChecked(not self._draw_btn.isChecked())
+
+    # ── Crop mode ─────────────────────────────────────────────────────────────
+
+    def _toggle_crop_mode(self):
+        if not self._images or self._current_idx < 0:
+            return
+        self._crop_btn.setChecked(not self._crop_btn.isChecked())
+
+    def _on_crop_btn(self, checked: bool):
+        if checked:
+            self._draw_btn.setChecked(False)
+            self._viewer.start_crop_mode()
+        else:
+            self._viewer.stop_crop_mode()
+
+    def _on_crop_confirmed(self, rect: QRectF):
+        self._crop_btn.setChecked(False)
+        self._apply_crop(rect)
+
+    def _on_crop_cancelled(self):
+        self._crop_btn.setChecked(False)
+
+    def _apply_crop(self, crop_rect: QRectF):
+        if self._current_idx < 0 or not self._images:
+            return
+        src = self._pending_image if self._pending_image is not None else \
+              QImage(str(self._images[self._current_idx]))
+        if src.isNull():
+            return
+        img_w, img_h = self._viewer.image_size
+        cx, cy = crop_rect.x(), crop_rect.y()
+        cw, ch = crop_rect.width(), crop_rect.height()
+        cropped = src.copy(int(round(cx)), int(round(cy)),
+                           int(round(cw)), int(round(ch)))
+        self._pending_image = cropped
+        current_anns = self._viewer.get_annotations()
+        new_anns = recalc_annotations_crop(
+            current_anns, img_w, img_h, cx, cy, cw, ch)
+        classes = self._config.names if self._config else []
+        self._viewer.reload_with_pixmap(QPixmap.fromImage(cropped), new_anns, classes)
+        self._dirty = True
+        self._save_btn.setEnabled(True)
+        self._clear_undo()
+        self._rebuild_ann_list()
+        self._update_status()
+
+    # ── Rotate ────────────────────────────────────────────────────────────────
+
+    def _rotate_image(self, clockwise: bool):
+        if self._current_idx < 0 or not self._images:
+            return
+        src = self._pending_image if self._pending_image is not None else \
+              QImage(str(self._images[self._current_idx]))
+        if src.isNull():
+            return
+        angle = 90 if clockwise else -90
+        rotated = src.transformed(QTransform().rotate(angle))
+        self._pending_image = rotated
+        current_anns = self._viewer.get_annotations()
+        new_anns = recalc_annotations_rotate(current_anns, clockwise)
+        classes = self._config.names if self._config else []
+        self._viewer.reload_with_pixmap(
+            QPixmap.fromImage(rotated), new_anns, classes)
+        self._dirty = True
+        self._save_btn.setEnabled(True)
+        self._clear_undo()
+        self._rebuild_ann_list()
+        self._update_status()
+
+    # ── Delete current image file ─────────────────────────────────────────────
+
+    def _delete_current_file(self):
+        if self._current_idx < 0 or not self._images:
+            return
+        path = self._images[self._current_idx]
+        if self._confirm_delete:
+            reply = QMessageBox.question(
+                self, "Delete File",
+                f"Delete '{path.name}' from disk?\nThis cannot be undone.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        label = get_label_path(path)
+        if label.exists():
+            try:
+                label.unlink()
+            except Exception:
+                pass
+        idx = self._current_idx
+        self._image_list.takeItem(idx)
+        self._image_list.remove_path(idx)
+        self._images.pop(idx)
+        self._dirty = False
+        self._clear_undo()
+        if self._images:
+            self._current_idx = -1
+            self._navigate_to(min(idx, len(self._images) - 1))
+        else:
+            self._current_idx = -1
+            self._viewer.scene().clear()
+            self._ann_items = []
+            self._ann_list.clear()
+            self._save_btn.setEnabled(False)
+            self._del_file_btn.setEnabled(False)
+            self._update_status()
+            self._update_assign_row()
+
+    # ── Class combo ───────────────────────────────────────────────────────────
+
+    def _on_class_combo_changed(self, idx: int):
+        if self._updating_ui or not self._config or idx < 0:
+            return
+        cname = self._config.names[idx]
+        color = class_color(idx)
+        self._sync_viewer_class(idx)
+
+        selected = [i for i in self._viewer.scene().selectedItems()
+                    if isinstance(i, (BBoxItem, SegmentItem))]
+        if selected:
+            self._capture_for_undo()
+            for item in selected:
+                item.set_class(idx, cname, color)
+            self._rebuild_ann_list()
+            self._on_annotation_changed()
+
+    def _sync_viewer_class(self, idx: int):
+        if not self._config or idx < 0 or idx >= len(self._config.names):
+            return
+        self._viewer.set_current_class(
+            idx, self._config.names[idx], class_color(idx))
+
+    # ── Annotation actions ────────────────────────────────────────────────────
+
+    def _capture_for_undo(self):
+        self._pre_edit_state = self._viewer.get_annotations()
+
+    def _on_annotation_changed(self):
+        if self._in_undo:
+            return
+        if self._pre_edit_state is not None:
+            self._push_undo(self._pre_edit_state)
+            self._pre_edit_state = None
+        self._dirty = True
+        self._save_btn.setEnabled(True)
+        self._update_status()
+
+    def _on_annotation_added(self, _=None):
+        self._rebuild_ann_list()
+
+    def _select_all_annotations(self):
+        for item in self._viewer.scene().items():
+            if isinstance(item, (BBoxItem, SegmentItem)):
+                item.setSelected(True)
+
+    def _on_delete(self):
+        if not self._viewer.scene().selectedItems():
+            return
+        self._capture_for_undo()
+        self._viewer.delete_selected()
+        self._rebuild_ann_list()
+
+    def _on_convert_to_bbox(self):
+        self._capture_for_undo()
+        self._viewer.convert_selected_to_bbox()
+        self._rebuild_ann_list()
+
+    # ── Status ────────────────────────────────────────────────────────────────
+
+    def _update_status(self):
+        if not self._images or self._current_idx < 0:
+            self._status_lbl.setText("No images loaded")
+            self._nav_counter.setText("–")
+            return
+        n = len(self._images)
+        i = self._current_idx + 1
+        self._nav_counter.setText(f"{i} / {n}")
+        path = self._images[self._current_idx]
+        name = path.name
+        marker = " *" if self._dirty else ""
+        img_w, img_h = self._viewer.image_size
+        px_info = f"{img_w}×{img_h}px"
+        try:
+            nbytes = os.path.getsize(path)
+            if nbytes >= 1_048_576:
+                sz = f"{nbytes/1_048_576:.1f} MB"
+            elif nbytes >= 1024:
+                sz = f"{nbytes/1024:.0f} KB"
+            else:
+                sz = f"{nbytes} B"
+        except OSError:
+            sz = "?"
+        undo_info = f"  ↩{len(self._undo_stack)}" if self._undo_stack else ""
+        self._status_lbl.setText(
+            f"{i}/{n}  {name}{marker}  {px_info}  {sz}{undo_info}")
+
+    # ── Brightness / contrast ─────────────────────────────────────────────────
+
+    def _on_bc_changed(self):
+        self._viewer.set_bc_adjustment(
+            self._bright_sl.value(), self._contr_sl.value())
+
+    # ── Segment double-click → convert ────────────────────────────────────────
+
+    def _on_segment_double_click(self, seg_item):
+        self._capture_for_undo()
+        self._viewer.scene().clearSelection()
+        seg_item.setSelected(True)
+        self._viewer.convert_selected_to_bbox()
+        self._rebuild_ann_list()
+
+    # ── Annotation list double-click → class change ───────────────────────────
+
+    def _on_ann_list_double_click(self, list_item):
+        if not self._config or len(self._config.names) <= 1:
+            return
+        row = self._ann_list.row(list_item)
+        if row < 0 or row >= len(self._ann_items):
+            return
+        ann_item = self._ann_items[row]
+        menu = QMenu(self)
+        for cid, name in enumerate(self._config.names):
+            act = QAction(_color_icon(class_color(cid)), name, self)
+            act.triggered.connect(
+                lambda checked, c=cid, it=ann_item: self._change_item_class(it, c))
+            menu.addAction(act)
+        menu.exec(QCursor.pos())
+
+    def _change_item_class(self, ann_item, class_id: int):
+        if not self._config or class_id >= len(self._config.names):
+            return
+        cname = self._config.names[class_id]
+        color = class_color(class_id)
+        self._capture_for_undo()
+        ann_item.set_class(class_id, cname, color)
+        self._rebuild_ann_list()
+        self._on_annotation_changed()
+
+    # ── Image status ──────────────────────────────────────────────────────────
+
+    def _load_progress(self):
+        try:
+            d = json.loads(PROGRESS_FILE.read_text())
+            for k, v in d.items():
+                try:
+                    self._img_status[k] = ImgStatus(v)
+                except ValueError:
+                    pass
+        except Exception:
+            pass
+
+    def _save_progress(self):
+        try:
+            d = {k: v.value for k, v in self._img_status.items()}
+            PROGRESS_FILE.write_text(json.dumps(d))
+        except Exception:
+            pass
+
+    def _get_img_status(self, path: Path) -> ImgStatus:
+        return self._img_status.get(str(path), ImgStatus.UNVIEWED)
+
+    def _set_img_status(self, path: Path, status: ImgStatus):
+        self._img_status[str(path)] = status
+        self._save_progress()
+        if path in self._images:
+            self._apply_status_color(self._images.index(path))
+
+    def _apply_status_color(self, idx: int):
+        if idx < 0 or idx >= self._image_list.count() or idx >= len(self._images):
+            return
+        item = self._image_list.item(idx)
+        if item is None:
+            return
+        status = self._get_img_status(self._images[idx])
+        if status == ImgStatus.UNVIEWED:
+            item.setForeground(QColor(110, 110, 110))
+            item.setBackground(QColor(0, 0, 0, 0))
+        elif status == ImgStatus.VIEWED:
+            item.setForeground(QColor(220, 220, 220))
+            item.setBackground(QColor(0, 0, 0, 0))
+        else:  # SAVED
+            item.setForeground(QColor(160, 230, 160))
+            item.setBackground(QColor(15, 45, 15))
+
+    def _on_image_list_context_menu(self, pos: QPoint):
+        item = self._image_list.itemAt(pos)
+        if item is None:
+            return
+        row = self._image_list.row(item)
+        if row < 0 or row >= len(self._images):
+            return
+        path = self._images[row]
+        menu = QMenu(self)
+        act_viewed  = QAction("✓ Проверено",  self)
+        act_saved   = QAction("● Отработано", self)
+        act_revisit = QAction("○ Отработать", self)
+        act_viewed.triggered.connect(
+            lambda: self._set_img_status(path, ImgStatus.VIEWED))
+        act_saved.triggered.connect(
+            lambda: self._set_img_status(path, ImgStatus.SAVED))
+        act_revisit.triggered.connect(
+            lambda: self._set_img_status(path, ImgStatus.UNVIEWED))
+        menu.addAction(act_viewed)
+        menu.addAction(act_saved)
+        menu.addAction(act_revisit)
+        menu.exec(self._image_list.mapToGlobal(pos))
+
+    def _on_double_esc(self):
+        if self._current_idx < 0 or not self._images:
+            return
+        path = self._images[self._current_idx]
+        self._set_img_status(path, ImgStatus.UNVIEWED)
+
+    # ── Close ─────────────────────────────────────────────────────────────────
+
+    def closeEvent(self, event):
+        if self._dirty:
+            if self._autosave_cb.isChecked():
+                self._save_current()
+            else:
+                reply = QMessageBox.question(
+                    self, "Unsaved Changes", "Save changes before closing?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No |
+                    QMessageBox.StandardButton.Cancel)
+                if reply == QMessageBox.StandardButton.Cancel:
+                    event.ignore()
+                    return
+                if reply == QMessageBox.StandardButton.Yes:
+                    self._save_current()
+        event.accept()
+
+    # ── Split assignment ──────────────────────────────────────────────────────
+
+    def _get_current_split(self) -> str:
+        return self._current_browse_split
+
+    def _update_assign_row(self):
+        current = self._get_current_split()
+        for split, btn in self._split_btns.items():
+            if split == "review":
+                btn.setChecked(False)
+                continue
+            btn.blockSignals(True)
+            btn.setChecked(split == current)
+            btn.blockSignals(False)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+        if current and current in SPLIT_COLORS:
+            color = SPLIT_COLORS[current]
+            self._split_badge_btn.setText(f" {current.upper()} ▾")
+            self._split_badge_btn.setStyleSheet(
+                f"QToolButton {{ background: {color}; color: #0c0d0f; "
+                f"border: none; border-radius: 3px; "
+                f"font-size: 10px; font-weight: 800; padding: 2px 8px; }}"
+                f"QToolButton::menu-indicator {{ image: none; }}"
+            )
+        else:
+            self._split_badge_btn.setText("– ▾")
+            self._split_badge_btn.setStyleSheet(
+                "QToolButton { background: #34373d; color: #9298a0; border: none; "
+                "border-radius: 3px; font-size: 10px; padding: 2px 8px; }"
+                "QToolButton::menu-indicator { image: none; }"
+            )
+
+    def _on_assign_split(self, target: str):
+        if not self._images or self._current_idx < 0 or not self._config:
+            return
+        current = self._get_current_split()
+        if target == current:
+            self._update_assign_row()
+            return
+
+        target_dir = self._config.splits.get(target)
+        if target_dir is None:
+            target_img_dir = self._config.config_dir / target / "images"
+            target_lbl_dir = self._config.config_dir / target / "labels"
+            if target != "review":
+                reply = QMessageBox.question(
+                    self, "Папка не найдена",
+                    f"Папка для сплита '{target}' не найдена.\n"
+                    f"Создать?\n{target_img_dir}",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                if reply != QMessageBox.StandardButton.Yes:
+                    self._update_assign_row()
+                    return
+            try:
+                target_img_dir.mkdir(parents=True, exist_ok=True)
+                target_lbl_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                QMessageBox.critical(
+                    self, "Error", f"Не удалось создать папку {target}:\n{e}")
+                self._update_assign_row()
+                return
+            self._config.splits[target] = target_img_dir
+            target_dir = target_img_dir
+
+        if self._dirty:
+            self._save_current()
+
+        path = self._images[self._current_idx]
+        label = get_label_path(path)
+        target_img   = target_dir / path.name
+        target_label = get_label_path(target_img)
+
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target_label.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(path), str(target_img))
+            if label.exists():
+                shutil.move(str(label), str(target_label))
+        except Exception as e:
+            QMessageBox.critical(self, "Move failed",
+                                 f"Could not move file:\n{e}")
+            self._update_assign_row()
+            return
+
+        idx = self._current_idx
+        self._image_list.takeItem(idx)
+        self._image_list.remove_path(idx)
+        self._images.pop(idx)
+        self._dirty = False
+        self._clear_undo()
+
+        if self._images:
+            self._current_idx = -1
+            self._navigate_to(min(idx, len(self._images) - 1))
+        else:
+            self._current_idx = -1
+            self._viewer.scene().clear()
+            self._ann_items = []
+            self._ann_list.clear()
+            self._save_btn.setEnabled(False)
+            self._del_file_btn.setEnabled(False)
+            self._update_status()
+            self._update_assign_row()
