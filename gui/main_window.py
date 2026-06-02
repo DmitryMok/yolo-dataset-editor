@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QListWidget, QLabel, QComboBox, QPushButton, QCheckBox,
     QFileDialog, QMessageBox, QListWidgetItem,
-    QToolButton, QMenu, QGroupBox, QDialog, QDialogButtonBox,
+    QToolButton, QMenu, QWidgetAction, QGroupBox, QDialog, QDialogButtonBox,
     QFormLayout, QSlider, QSizePolicy, QButtonGroup, QStyle,
     QApplication, QSpinBox,
 )
@@ -26,7 +26,7 @@ from core.folder_detect import detect_folder, execute_normalization
 from gui.editor.viewer import ImageViewer
 from gui.editor.items import BBoxItem, SegmentItem, class_color, set_label_px
 from gui.editor.image_list_widget import ImageListWidget
-from gui.style import SPLIT_COLORS, TEXT_DIM
+from gui.style import SPLIT_COLORS, TEXT, TEXT_DIM, DANGER, PANEL3
 from gui.dialogs.folder_import_dialog import FolderImportDialog
 
 # ─── SVG icon helpers ─────────────────────────────────────────────────────────
@@ -150,6 +150,29 @@ def _truncate_middle(text: str, max_len: int) -> str:
     keep = max_len - 1  # 1 char for ellipsis
     front = keep * 2 // 3
     return text[:front] + "…" + text[-(keep - front):]
+
+
+class _HistoryItem(QLabel):
+    """Label for a history entry inside QWidgetAction."""
+
+    def __init__(self, text: str, missing: bool, action, menu):
+        super().__init__(text)
+        self._action = action
+        self._menu = menu
+        self._missing = missing
+        self.setContentsMargins(20, 4, 20, 4)
+        self._set_active(False)
+
+    def _set_active(self, active: bool):
+        bg = PANEL3 if active else "transparent"
+        color = DANGER if self._missing else TEXT
+        self.setStyleSheet(
+            f"color: {color}; background: {bg}; font-size: 13px;")
+
+    def enterEvent(self, event):
+        # Trigger hovered signal so _on_history_hovered updates all labels
+        self._menu.setActiveAction(self._action)
+        super().enterEvent(event)
 
 
 # ─── Main window ──────────────────────────────────────────────────────────────
@@ -297,6 +320,8 @@ class MainWindow(QMainWindow):
         self._open_btn.setToolTip(
             "Открыть папку датасета\n▾ — история / открыть YAML")
         self._open_menu = QMenu(self)
+        self._open_menu.installEventFilter(self)
+        self._open_menu.hovered.connect(self._on_history_hovered)
         self._open_btn.setMenu(self._open_menu)
         self._open_btn.clicked.connect(self._open_folder)
         self._populate_open_menu()
@@ -802,6 +827,15 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def eventFilter(self, obj, event):
+        open_menu = getattr(self, '_open_menu', None)
+        if open_menu is not None and obj is open_menu \
+                and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Delete:
+                pos = open_menu.mapFromGlobal(QCursor.pos())
+                act = open_menu.actionAt(pos) or open_menu.activeAction()
+                if act is not None and act.data():
+                    self._delete_history_entry(str(act.data()))
+                    return True
         if obj is self._viewer.viewport() and event.type() == QEvent.Type.KeyPress:
             key = event.key()
             if key in (Qt.Key.Key_Left, Qt.Key.Key_Right,
@@ -1012,8 +1046,36 @@ class MainWindow(QMainWindow):
             pass
         self._populate_open_menu()
 
+    def _delete_history_entry(self, path_str: str):
+        hist = [p for p in self._load_history() if p != path_str]
+        try:
+            HISTORY_FILE.write_text(json.dumps(hist))
+        except Exception:
+            pass
+        # Remove just the matching action from the open menu so it stays visible
+        for act in self._open_menu.actions():
+            if isinstance(act, QWidgetAction) and act.data() == path_str:
+                self._open_menu.removeAction(act)
+                break
+        # Remove separator if no history items remain
+        remaining = [a for a in self._open_menu.actions()
+                     if isinstance(a, QWidgetAction)]
+        if not remaining:
+            for act in self._open_menu.actions():
+                if act.isSeparator():
+                    self._open_menu.removeAction(act)
+                    break
+
+    def _on_history_hovered(self, action):
+        for act in self._open_menu.actions():
+            if isinstance(act, QWidgetAction):
+                w = act.defaultWidget()
+                if isinstance(w, _HistoryItem):
+                    w._set_active(act is action)
+
     def _populate_open_menu(self):
         self._open_menu.clear()
+        self._history_widgets: list = []  # keep Python refs so GC won't drop wrappers
         act_folder = QAction("Открыть папку...", self)
         act_folder.triggered.connect(self._open_folder)
         self._open_menu.addAction(act_folder)
@@ -1024,10 +1086,15 @@ class MainWindow(QMainWindow):
         if hist:
             self._open_menu.addSeparator()
             for p in hist:
-                act = QAction(p, self)
-                act.triggered.connect(
+                missing = not Path(p).exists()
+                wa = QWidgetAction(self._open_menu)
+                wa.setData(p)
+                lbl = _HistoryItem(p, missing, wa, self._open_menu)
+                wa.setDefaultWidget(lbl)
+                wa.triggered.connect(
                     lambda checked, _p=p: self._load_config_from_path(_p))
-                self._open_menu.addAction(act)
+                self._open_menu.addAction(wa)
+                self._history_widgets.append(lbl)
 
     def _open_folder(self):
         start_dir = ""
