@@ -163,16 +163,29 @@ QToolButton#tbtn::menu-arrow {{
     font-size: 12px;
     font-variant-numeric: tabular-nums;
 }}
-QCheckBox#auto-advance-cb {{
-    background: transparent;
-    font-size: 12px;
-    color: {TEXT_DIM};
-}}
 
 QCheckBox#move-enabled-cb {{
     background: transparent;
     font-size: 12px;
     color: {TEXT_DIM};
+}}
+QCheckBox#nn-preview-cb {{
+    background: transparent;
+    font-size: 12px;
+    color: {TEXT_DIM};
+}}
+QSpinBox#nn-size-spin {{
+    background: {PANEL2};
+    color: {TEXT_DIM};
+    border: 1px solid {BORDER_S};
+    border-radius: 4px;
+    padding: 0px 4px;
+    font-size: 12px;
+}}
+QSpinBox#nn-size-spin::up-button, QSpinBox#nn-size-spin::down-button {{
+    width: 0px;
+    height: 0px;
+    border: none;
 }}
 
 /* ── Assign row ─────────────────────────────────────────── */

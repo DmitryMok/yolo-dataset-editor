@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QMessageBox, QListWidgetItem,
     QToolButton, QMenu, QGroupBox, QDialog, QDialogButtonBox,
     QFormLayout, QSlider, QSizePolicy, QButtonGroup, QStyle,
-    QApplication,
+    QApplication, QSpinBox,
 )
 from PyQt6.QtCore import Qt, QTimer, QRectF, QPoint, QPointF, QEvent, QSize
 from PyQt6.QtGui import (QAction, QKeySequence, QShortcut, QColor,
@@ -20,7 +20,8 @@ from PyQt6.QtGui import (QAction, QKeySequence, QShortcut, QColor,
 
 from core.config_io import DatasetConfig
 from core.annotation_io import load_annotations, save_annotations, get_images, get_label_path
-from core.image_ops import recalc_annotations_crop, recalc_annotations_rotate
+from core.image_ops import (recalc_annotations_crop, recalc_annotations_rotate,
+                            recalc_annotations_mosaic)
 from core.folder_detect import detect_folder, execute_normalization
 from gui.editor.viewer import ImageViewer
 from gui.editor.items import BBoxItem, SegmentItem, class_color, set_label_px
@@ -87,7 +88,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setModal(True)
-        self.setFixedSize(320, 220)
+        self.setFixedSize(320, 265)
         layout = QVBoxLayout(self)
 
         mouse_group = QGroupBox("Mouse buttons")
@@ -107,6 +108,14 @@ class SettingsDialog(QDialog):
         self._confirm_del_cb = QCheckBox()
         self._confirm_del_cb.setChecked(current.get("confirm_delete", True))
         eg.addRow("Confirm file delete:", self._confirm_del_cb)
+
+        self._mosaic_step_spin = QSpinBox()
+        self._mosaic_step_spin.setRange(1, 100)
+        self._mosaic_step_spin.setValue(current.get("mosaic_step", 20))
+        self._mosaic_step_spin.setSuffix(" %")
+        self._mosaic_step_spin.setToolTip(
+            "Шаг масштаба между тайлами мозаики (% от базового 0.5×)")
+        eg.addRow("Mosaic scale step:", self._mosaic_step_spin)
         layout.addWidget(edit_group)
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
@@ -120,6 +129,7 @@ class SettingsDialog(QDialog):
             "pan_button": "right" if self._pan_combo.currentIndex() == 0 else "middle",
             "fit_button": "middle" if self._fit_combo.currentIndex() == 0 else "right",
             "confirm_delete": self._confirm_del_cb.isChecked(),
+            "mosaic_step": self._mosaic_step_spin.value(),
         }
 
 
@@ -145,8 +155,17 @@ class MainWindow(QMainWindow):
         self._ann_items: List = []
 
         self._pending_image: QImage | None = None
+        self._pre_mosaic_image: QImage | None = None
+        self._pre_mosaic_anns: list | None = None
+        self._pre_mosaic_dirty: bool = False
+        self._pre_mosaic_had_pending: bool = False
+        self._pre_mosaic_nn_preview: bool = False
+        self._mosaic_grid_size: int = 0
         self._current_browse_split = ""
         self._confirm_delete = True
+        self._mosaic_step: int = 20
+        self._nn_size = 640
+        self._nn_preview = False
 
         self._undo_stack: deque = deque(maxlen=self.UNDO_LIMIT)
         self._redo_stack: deque = deque(maxlen=self.UNDO_LIMIT)
@@ -168,6 +187,7 @@ class MainWindow(QMainWindow):
         self._apply_mouse_settings()
         self.setWindowTitle("YOLO Annotator")
         self.resize(1440, 920)
+        self._restore_window_geometry()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -396,11 +416,25 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._nav_next, 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addStretch()
 
-        self._auto_advance_cb = QCheckBox("Авто-переход")
-        self._auto_advance_cb.setObjectName("auto-advance-cb")
-        self._auto_advance_cb.setToolTip(
-            "После назначения сплита (1/2/3) автоматически перейти к следующему изображению")
-        lay.addWidget(self._auto_advance_cb)
+        self._nn_size_spin = QSpinBox()
+        self._nn_size_spin.setObjectName("nn-size-spin")
+        self._nn_size_spin.setRange(32, 4096)
+        self._nn_size_spin.setSingleStep(32)
+        self._nn_size_spin.setValue(self._nn_size)
+        self._nn_size_spin.setSuffix(" px")
+        self._nn_size_spin.setFixedWidth(76)
+        self._nn_size_spin.setFixedHeight(22)
+        self._nn_size_spin.setToolTip("Размер входа нейронной сети")
+        self._nn_size_spin.valueChanged.connect(self._on_nn_size_changed)
+
+        self._nn_preview_cb = QCheckBox("Размер нейросети")
+        self._nn_preview_cb.setObjectName("nn-preview-cb")
+        self._nn_preview_cb.setToolTip(
+            "Показать изображение в масштабе нейронной сети (только предпросмотр, не сохраняется)")
+        self._nn_preview_cb.toggled.connect(self._on_nn_preview_toggled)
+
+        lay.addWidget(self._nn_size_spin, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addWidget(self._nn_preview_cb, 0, Qt.AlignmentFlag.AlignVCenter)
 
         return nav
 
@@ -600,11 +634,24 @@ class MainWindow(QMainWindow):
         ig.setContentsMargins(4, 6, 4, 4)
         ig.setSpacing(4)
 
+        crop_mosaic_row = QWidget()
+        cm_lay = QHBoxLayout(crop_mosaic_row)
+        cm_lay.setContentsMargins(0, 0, 0, 0)
+        cm_lay.setSpacing(4)
+
         self._crop_btn = QPushButton("✂ Crop  [X]")
         self._crop_btn.setCheckable(True)
         self._crop_btn.setToolTip("Режим кадрирования [X]")
         self._crop_btn.toggled.connect(self._on_crop_btn)
-        ig.addWidget(self._crop_btn)
+
+        self._mosaic_btn = QPushButton("⊞ Mosaic  [M]")
+        self._mosaic_btn.setToolTip("Мозаика 2×2 из текущего изображения [M]")
+        self._mosaic_btn.clicked.connect(self._apply_mosaic)
+        self._mosaic_btn.setEnabled(False)
+
+        cm_lay.addWidget(self._crop_btn)
+        cm_lay.addWidget(self._mosaic_btn)
+        ig.addWidget(crop_mosaic_row)
 
         rot_row = QWidget()
         rot_lay = QHBoxLayout(rot_row)
@@ -675,6 +722,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_Space),  self, self._toggle_draw_mode)
         QShortcut(QKeySequence(Qt.Key.Key_D),      self, self._delete_current_file)
         QShortcut(QKeySequence("X"),               self, self._toggle_crop_mode)
+        QShortcut(QKeySequence("M"),               self, self._apply_mosaic)
         QShortcut(QKeySequence("R"),               self, lambda: self._rotate_image(clockwise=True))
         QShortcut(QKeySequence("Shift+R"),         self, lambda: self._rotate_image(clockwise=False))
         QShortcut(QKeySequence("Ctrl+A"),          self, self._select_all_annotations)
@@ -687,6 +735,9 @@ class MainWindow(QMainWindow):
         key = event.key()
 
         if key == Qt.Key.Key_Escape:
+            if self._pre_mosaic_image is not None:
+                self._revert_mosaic()
+                return
             if self._esc_pending:
                 self._esc_timer.stop()
                 self._esc_pending = False
@@ -765,6 +816,8 @@ class MainWindow(QMainWindow):
             d = json.loads(SETTINGS_FILE.read_text())
             set_label_px(d.get('label_px', 12))
             self._confirm_delete = d.get("confirm_delete", True)
+            self._mosaic_step = d.get("mosaic_step", 20)
+            self._nn_size = d.get("nn_size", 640)
             self._mouse_settings = {
                 "pan_button": d.get("pan_button", "right"),
                 "fit_button": d.get("fit_button", "middle"),
@@ -778,11 +831,14 @@ class MainWindow(QMainWindow):
             self._mouse_settings["fit_button"])
 
     def _open_settings(self):
-        current = {**self._mouse_settings, "confirm_delete": self._confirm_delete}
+        current = {**self._mouse_settings,
+                   "confirm_delete": self._confirm_delete,
+                   "mosaic_step": self._mosaic_step}
         dlg = SettingsDialog(current, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             new = dlg.get_settings()
             self._confirm_delete = new.pop("confirm_delete", True)
+            self._mosaic_step = new.pop("mosaic_step", 20)
             self._mouse_settings.update(new)
             self._apply_mouse_settings()
             self._save_settings()
@@ -795,6 +851,8 @@ class MainWindow(QMainWindow):
                 d = {}
             d.update(self._mouse_settings)
             d["confirm_delete"] = self._confirm_delete
+            d["mosaic_step"] = self._mosaic_step
+            d["nn_size"] = self._nn_size
             SETTINGS_FILE.write_text(json.dumps(d))
         except Exception:
             pass
@@ -809,6 +867,53 @@ class MainWindow(QMainWindow):
             SETTINGS_FILE.write_text(json.dumps(d))
         except Exception:
             pass
+
+    def _make_letterbox(self, pix: QPixmap, size: int):
+        """Scale pix to fit size×size with black padding. Returns (pixmap, sw, sh, pad_x, pad_y)."""
+        from PyQt6.QtGui import QPainter
+        scaled = pix.scaled(size, size,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation)
+        sw, sh = scaled.width(), scaled.height()
+        pad_x = (size - sw) // 2
+        pad_y = (size - sh) // 2
+        result = QPixmap(size, size)
+        result.fill(Qt.GlobalColor.black)
+        painter = QPainter(result)
+        painter.drawPixmap(pad_x, pad_y, scaled)
+        painter.end()
+        return result, sw, sh, pad_x, pad_y
+
+    def _remap_anns_letterbox(self, anns, sw, sh, pad_x, pad_y, size):
+        """Remap normalized annotation coords from original image space to letterboxed canvas space."""
+        from core.models import Annotation, AnnType
+        result = []
+        for ann in anns:
+            if ann.ann_type == AnnType.BBOX:
+                cx, cy, w, h = ann.data
+                new_cx = (cx * sw + pad_x) / size
+                new_cy = (cy * sh + pad_y) / size
+                new_w  = w * sw / size
+                new_h  = h * sh / size
+                result.append(Annotation(ann.class_id, AnnType.BBOX,
+                                         [new_cx, new_cy, new_w, new_h]))
+            else:
+                new_data = []
+                for i in range(0, len(ann.data), 2):
+                    new_data.append((ann.data[i]     * sw + pad_x) / size)
+                    new_data.append((ann.data[i + 1] * sh + pad_y) / size)
+                result.append(Annotation(ann.class_id, AnnType.SEGMENT, new_data))
+        return result
+
+    def _on_nn_size_changed(self, value: int):
+        self._nn_size = value
+        self._save_settings()
+        if self._nn_preview:
+            self._load_current_image()
+
+    def _on_nn_preview_toggled(self, checked: bool):
+        self._nn_preview = checked
+        self._load_current_image()
 
     # ── Config history ────────────────────────────────────────────────────────
 
@@ -1020,17 +1125,34 @@ class MainWindow(QMainWindow):
         if self._current_idx < 0 or not self._images:
             return
         self._pending_image = None
+        self._pre_mosaic_image = None
+        self._pre_mosaic_anns = None
+        self._pre_mosaic_dirty = False
+        self._pre_mosaic_had_pending = False
+        self._pre_mosaic_nn_preview = False
+        self._mosaic_grid_size = 0
+        self._mosaic_btn.setToolTip("Мозаика 2×2 [M]")
         self._viewer.stop_crop_mode()
         self._crop_btn.setChecked(False)
         path = self._images[self._current_idx]
         anns = load_annotations(path)
         classes = self._config.names if self._config else []
-        self._viewer.load_image(path, anns, classes)
+        if self._nn_preview:
+            pix = QPixmap(str(path))
+            if not pix.isNull():
+                lb_pix, sw, sh, pad_x, pad_y = self._make_letterbox(pix, self._nn_size)
+                lb_anns = self._remap_anns_letterbox(anns, sw, sh, pad_x, pad_y, self._nn_size)
+                self._viewer.reload_with_pixmap(lb_pix, lb_anns, classes)
+            else:
+                self._viewer.load_image(path, anns, classes)
+        else:
+            self._viewer.load_image(path, anns, classes)
         self._bright_sl.setValue(0)
         self._contr_sl.setValue(0)
         self._dirty = False
         self._save_btn.setEnabled(True)
         self._del_file_btn.setEnabled(True)
+        self._mosaic_btn.setEnabled(True)
         self._clear_undo()
         self._rebuild_ann_list()
         self._update_status()
@@ -1052,6 +1174,8 @@ class MainWindow(QMainWindow):
         if self._pending_image is not None:
             self._pending_image.save(str(path))
             self._pending_image = None
+        self._pre_mosaic_image = None
+        self._pre_mosaic_anns = None
         save_annotations(path, self._viewer.get_annotations())
         self._dirty = False
         self._viewer.scene().clearSelection()
@@ -1092,6 +1216,9 @@ class MainWindow(QMainWindow):
         self._redo_btn.setEnabled(False)
 
     def _undo(self):
+        if self._pre_mosaic_image is not None:
+            self._revert_mosaic()
+            return
         if not self._undo_stack:
             return
         self._redo_stack.append(self._viewer.get_annotations())
@@ -1254,6 +1381,185 @@ class MainWindow(QMainWindow):
         self._dirty = True
         self._save_btn.setEnabled(True)
         self._clear_undo()
+        self._rebuild_ann_list()
+        self._update_status()
+
+    # ── Mosaic ────────────────────────────────────────────────────────────────
+
+    def _apply_mosaic(self):
+        if self._current_idx < 0 or not self._images:
+            return
+
+        from PyQt6.QtGui import QPainter
+        from core.models import AnnType
+
+        path = self._images[self._current_idx]
+
+        if self._pre_mosaic_image is not None:
+            # Subsequent click: increment grid, rebuild from original (pre-mosaic) image.
+            next_N = self._mosaic_grid_size + 1
+            if next_N > 8:
+                return
+            self._mosaic_grid_size = next_N
+            src = self._pre_mosaic_image
+            current_anns = self._pre_mosaic_anns
+            use_nn = self._pre_mosaic_nn_preview
+        else:
+            # First click: load source and save pre-mosaic state.
+            use_nn = self._nn_preview_cb.isChecked()
+            if use_nn:
+                src = QImage(str(path))
+                if src.isNull():
+                    return
+                current_anns = load_annotations(path)
+            else:
+                src = self._pending_image if self._pending_image is not None else \
+                      QImage(str(path))
+                if src.isNull():
+                    return
+                current_anns = self._viewer.get_annotations()
+            self._mosaic_grid_size = 2
+            self._pre_mosaic_had_pending = self._pending_image is not None
+            self._pre_mosaic_image = src.copy()
+            self._pre_mosaic_anns = list(current_anns)
+            self._pre_mosaic_dirty = self._dirty
+            self._pre_mosaic_nn_preview = use_nn
+
+        N = self._mosaic_grid_size
+        n_tiles = N * N
+        base_scale = 1.0 / N
+        # mosaic_step = total spread between smallest and largest tile (in % of src size)
+        # step per tile = spread / n_tiles  (per user spec: e.g. 20% / 4 tiles = 5%)
+        step = self._mosaic_step / 100.0 / n_tiles
+
+        src_w = src.width()
+        src_h = src.height()
+        out_w = out_h = self._nn_size if use_nn else None
+        if out_w is None:
+            out_w, out_h = src_w, src_h
+
+        cell_w = out_w // N
+        cell_h = out_h // N
+
+        def _visible_area(anns, scale, crx, cry):
+            total = 0.0
+            sw = src_w * scale
+            sh = src_h * scale
+            for ann in anns:
+                if ann.ann_type == AnnType.BBOX:
+                    ncx, ncy, nw, nh = ann.data
+                    x1 = (ncx - nw / 2) * sw - crx
+                    x2 = (ncx + nw / 2) * sw - crx
+                    y1 = (ncy - nh / 2) * sh - cry
+                    y2 = (ncy + nh / 2) * sh - cry
+                    vis_w = max(0.0, min(x2, cell_w) - max(x1, 0.0))
+                    vis_h = max(0.0, min(y2, cell_h) - max(y1, 0.0))
+                    total += vis_w * vis_h
+                else:
+                    xs = [ann.data[i] * sw - crx for i in range(0, len(ann.data), 2)]
+                    ys = [ann.data[i] * sh - cry for i in range(1, len(ann.data), 2)]
+                    if xs and ys:
+                        vis_w = max(0.0, min(max(xs), cell_w) - max(min(xs), 0.0))
+                        vis_h = max(0.0, min(max(ys), cell_h) - max(min(ys), 0.0))
+                        total += vis_w * vis_h
+            return total
+
+        output = QImage(out_w, out_h, QImage.Format.Format_RGB32)
+        output.fill(Qt.GlobalColor.black)
+        painter = QPainter(output)
+
+        all_anns = []
+
+        for row in range(N):
+            for col in range(N):
+                # Scale index: 0 = BL (smallest), increases left→right, bottom→top
+                scale_idx = (N - 1 - row) * N + col
+                scale = base_scale + scale_idx * step
+                cell_x = col * cell_w
+                cell_y = row * cell_h
+                outer_left = (col == 0)
+                outer_top  = (row == 0)
+
+                scaled_w = int(round(scale * src_w))
+                scaled_h = int(round(scale * src_h))
+                overflow_x = max(0, scaled_w - cell_w)
+                overflow_y = max(0, scaled_h - cell_h)
+
+                default_cx = overflow_x if outer_left else 0
+                default_cy = overflow_y if outer_top  else 0
+                alt_cx = 0 if outer_left else overflow_x
+                alt_cy = 0 if outer_top  else overflow_y
+
+                crop_x = default_cx
+                if overflow_x > 0 and current_anns:
+                    if _visible_area(current_anns, scale, alt_cx, default_cy) > \
+                       _visible_area(current_anns, scale, default_cx, default_cy):
+                        crop_x = alt_cx
+
+                crop_y = default_cy
+                if overflow_y > 0 and current_anns:
+                    if _visible_area(current_anns, scale, crop_x, alt_cy) > \
+                       _visible_area(current_anns, scale, crop_x, default_cy):
+                        crop_y = alt_cy
+
+                scaled_img = src.scaled(scaled_w, scaled_h,
+                                        Qt.AspectRatioMode.IgnoreAspectRatio,
+                                        Qt.TransformationMode.SmoothTransformation)
+                painter.drawImage(cell_x, cell_y, scaled_img,
+                                  int(crop_x), int(crop_y), cell_w, cell_h)
+
+                tile_anns = recalc_annotations_mosaic(
+                    current_anns, src_w, src_h, scale,
+                    crop_x, crop_y, cell_x, cell_y, cell_w, cell_h, out_w, out_h)
+                all_anns.extend(tile_anns)
+
+        painter.end()
+
+        self._pending_image = output
+        classes = self._config.names if self._config else []
+        self._viewer.reload_with_pixmap(QPixmap.fromImage(output), all_anns, classes)
+        self._dirty = True
+        self._save_btn.setEnabled(True)
+        self._rebuild_ann_list()
+        self._update_status()
+
+        next_N = N + 1
+        if next_N <= 8:
+            self._mosaic_btn.setToolTip(
+                f"Мозаика {N}×{N} применена. Нажмите для {next_N}×{next_N} [M]")
+        else:
+            self._mosaic_btn.setToolTip(f"Мозаика {N}×{N} (максимум). Esc/Ctrl+Z — отмена [M]")
+
+    def _revert_mosaic(self):
+        if self._pre_mosaic_image is None:
+            return
+        classes = self._config.names if self._config else []
+        pre_img = self._pre_mosaic_image
+        pre_anns = self._pre_mosaic_anns
+        had_pending = self._pre_mosaic_had_pending
+        was_dirty = self._pre_mosaic_dirty
+        was_nn_preview = self._pre_mosaic_nn_preview
+        self._pre_mosaic_image = None
+        self._pre_mosaic_anns = None
+        self._pre_mosaic_dirty = False
+        self._pre_mosaic_had_pending = False
+        self._pre_mosaic_nn_preview = False
+        self._mosaic_grid_size = 0
+        self._mosaic_btn.setToolTip("Мозаика 2×2 [M]")
+        if was_nn_preview:
+            # Restore letterbox display: re-apply letterbox transform to original annotations.
+            path = self._images[self._current_idx]
+            pix = QPixmap(str(path))
+            self._pending_image = None
+            if not pix.isNull():
+                lb_pix, sw, sh, pad_x, pad_y = self._make_letterbox(pix, self._nn_size)
+                lb_anns = self._remap_anns_letterbox(pre_anns, sw, sh, pad_x, pad_y, self._nn_size)
+                self._viewer.reload_with_pixmap(lb_pix, lb_anns, classes)
+        else:
+            self._pending_image = pre_img if had_pending else None
+            self._viewer.reload_with_pixmap(QPixmap.fromImage(pre_img), pre_anns, classes)
+        self._dirty = was_dirty
+        self._save_btn.setEnabled(was_dirty)
         self._rebuild_ann_list()
         self._update_status()
 
@@ -1504,7 +1810,32 @@ class MainWindow(QMainWindow):
 
     # ── Close ─────────────────────────────────────────────────────────────────
 
+    def _restore_window_geometry(self):
+        try:
+            d = json.loads(SETTINGS_FILE.read_text())
+            geom = d.get("window_geometry")
+            maximized = d.get("window_maximized", False)
+            if geom:
+                self.restoreGeometry(bytes.fromhex(geom))
+            if maximized:
+                self.showMaximized()
+        except Exception:
+            pass
+
+    def _save_window_geometry(self):
+        try:
+            try:
+                d = json.loads(SETTINGS_FILE.read_text())
+            except Exception:
+                d = {}
+            d["window_geometry"] = self.saveGeometry().toHex().data().decode()
+            d["window_maximized"] = self.isMaximized()
+            SETTINGS_FILE.write_text(json.dumps(d))
+        except Exception:
+            pass
+
     def closeEvent(self, event):
+        self._save_window_geometry()
         if self._dirty:
             if self._autosave_cb.isChecked():
                 self._save_current()
