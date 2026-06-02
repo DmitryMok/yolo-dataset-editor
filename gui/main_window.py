@@ -47,6 +47,7 @@ _ICON_PATHS = {
                "L20 9l-1.6 2.4L20 14l-3.1 1.3-.6 2.8-2.8-.6L12 20l-1.5-2.1"
                "-2.8.6-.6-2.8L4 14l1.6-2L4 9l3.1-1.3.6-2.8 2.8.6z"),
     "trash":  "M3 6h18M8 6V4h8v2M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M10 11v6M14 11v6",
+    "copy":   "M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1M11 9h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2z",
 }
 
 
@@ -544,6 +545,7 @@ class MainWindow(QMainWindow):
         _app_style = QApplication.instance().style()
         _ic_save  = (_svg_icon("save") or
                      _app_style.standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
+        _ic_copy  = _svg_icon("copy")
         _ic_trash = _svg_icon("trash")
 
         self._save_btn = QToolButton(self)
@@ -552,9 +554,22 @@ class MainWindow(QMainWindow):
         self._save_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self._save_btn.setObjectName("panel-head-btn")
         self._save_btn.setFixedSize(24, 22)
-        self._save_btn.setToolTip("Сохранить аннотации (Ctrl+S)")
+        self._save_btn.setToolTip("Сохранить изменения (Ctrl+S)")
         self._save_btn.clicked.connect(self._on_save)
         self._save_btn.setEnabled(False)
+
+        self._dup_btn = QToolButton(self)
+        if _ic_copy:
+            self._dup_btn.setIcon(_ic_copy)
+            self._dup_btn.setIconSize(QSize(16, 16))
+            self._dup_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        else:
+            self._dup_btn.setText("⧉")
+        self._dup_btn.setObjectName("panel-head-btn")
+        self._dup_btn.setFixedSize(24, 22)
+        self._dup_btn.setToolTip("Дублировать изображение")
+        self._dup_btn.clicked.connect(self._duplicate_current_image)
+        self._dup_btn.setEnabled(False)
 
         self._del_file_btn = QToolButton(self)
         if _ic_trash:
@@ -570,6 +585,7 @@ class MainWindow(QMainWindow):
         self._del_file_btn.setEnabled(False)
 
         hr_lay.addWidget(self._save_btn)
+        hr_lay.addWidget(self._dup_btn)
         hr_lay.addWidget(self._del_file_btn)
         lay.addWidget(header_row)
 
@@ -1079,6 +1095,7 @@ class MainWindow(QMainWindow):
 
         self._clear_scene()
         self._save_btn.setEnabled(False)
+        self._dup_btn.setEnabled(False)
         self._del_file_btn.setEnabled(False)
         self._update_status()
         self._update_assign_row()
@@ -1151,6 +1168,7 @@ class MainWindow(QMainWindow):
         self._contr_sl.setValue(0)
         self._dirty = False
         self._save_btn.setEnabled(True)
+        self._dup_btn.setEnabled(True)
         self._del_file_btn.setEnabled(True)
         self._mosaic_btn.setEnabled(True)
         self._clear_undo()
@@ -1587,9 +1605,37 @@ class MainWindow(QMainWindow):
             self._current_idx = -1
             self._clear_scene()
             self._save_btn.setEnabled(False)
+            self._dup_btn.setEnabled(False)
             self._del_file_btn.setEnabled(False)
             self._update_status()
             self._update_assign_row()
+
+    # ── Duplicate current image ───────────────────────────────────────────────
+
+    def _duplicate_current_image(self):
+        if self._current_idx < 0 or not self._images:
+            return
+        src_path = self._images[self._current_idx]
+        parent = src_path.parent
+        stem = src_path.stem
+        suffix = src_path.suffix
+        dst_path = parent / f"{stem}_copy{suffix}"
+        n = 2
+        while dst_path.exists():
+            dst_path = parent / f"{stem}_copy_{n}{suffix}"
+            n += 1
+        shutil.copy2(src_path, dst_path)
+        src_label = get_label_path(src_path)
+        if src_label.exists():
+            shutil.copy2(src_label, get_label_path(dst_path))
+        new_idx = self._current_idx + 1
+        self._images.insert(new_idx, dst_path)
+        self._image_list.blockSignals(True)
+        self._image_list.insertItem(new_idx, dst_path.name)
+        self._image_list.blockSignals(False)
+        self._image_list.insert_path(new_idx, dst_path)
+        self._apply_status_color(new_idx)
+        self._navigate_to(new_idx)
 
     # ── Class combo ───────────────────────────────────────────────────────────
 
@@ -1941,6 +1987,7 @@ class MainWindow(QMainWindow):
             self._current_idx = -1
             self._clear_scene()
             self._save_btn.setEnabled(False)
+            self._dup_btn.setEnabled(False)
             self._del_file_btn.setEnabled(False)
             self._update_status()
             self._update_assign_row()

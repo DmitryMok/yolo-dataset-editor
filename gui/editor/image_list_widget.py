@@ -238,3 +238,19 @@ class ImageListWidget(QListWidget):
             elif k > index:
                 new_cache[k - 1] = v
         self._preview_cache = new_cache
+
+    def insert_path(self, index: int, path: Path):
+        """Insert one entry, shifting existing caches and triggering icon load."""
+        self._paths.insert(index, path)
+        self._preview_lbl.hide()
+        self._hover_row = -1
+        new_cache = {(k + 1 if k >= index else k): v
+                     for k, v in self._preview_cache.items()}
+        self._preview_cache = new_cache
+        self._icons_loaded = {(k + 1 if k >= index else k) for k in self._icons_loaded}
+        item = self.item(index)
+        if item:
+            item.setIcon(self._placeholder_icon)
+        loader = _IconLoader(self._paths, self.ICON_W, self.ICON_H, [index], self)
+        loader.icon_ready.connect(self._on_icon_ready)
+        loader.start()
