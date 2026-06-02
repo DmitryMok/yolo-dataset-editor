@@ -26,7 +26,7 @@ from core.folder_detect import detect_folder, execute_normalization
 from gui.editor.viewer import ImageViewer
 from gui.editor.items import BBoxItem, SegmentItem, class_color, set_label_px
 from gui.editor.image_list_widget import ImageListWidget
-from gui.style import SPLIT_COLORS
+from gui.style import SPLIT_COLORS, TEXT_DIM
 from gui.dialogs.folder_import_dialog import FolderImportDialog
 
 # ─── SVG icon helpers ─────────────────────────────────────────────────────────
@@ -138,6 +138,18 @@ def _color_icon(color: QColor, size: int = 14) -> QIcon:
     pix = QPixmap(size, size)
     pix.fill(color)
     return QIcon(pix)
+
+
+_MAX_PATH_CHARS = 60
+_MAX_NAME_CHARS = 40
+
+
+def _truncate_middle(text: str, max_len: int) -> str:
+    if len(text) <= max_len:
+        return text
+    keep = max_len - 1  # 1 char for ellipsis
+    front = keep * 2 // 3
+    return text[:front] + "…" + text[-(keep - front):]
 
 
 # ─── Main window ──────────────────────────────────────────────────────────────
@@ -320,6 +332,12 @@ class MainWindow(QMainWindow):
         z2l.addWidget(self._redo_btn)
 
         lay.addWidget(z2, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        lay.addSpacing(12)
+        self._dataset_path_lbl = QLabel("")
+        self._dataset_path_lbl.setStyleSheet(
+            f"color: {TEXT_DIM}; font-size: 12px; background: transparent;")
+        lay.addWidget(self._dataset_path_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
 
         lay.addStretch()
         lay.addWidget(self._make_sep())
@@ -1065,6 +1083,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to parse config:\n{e}")
             return
         self._save_history(path)
+        self._update_dataset_path_display()
 
         self._class_combo.clear()
         for cid, name in enumerate(self._config.names):
@@ -1420,19 +1439,39 @@ class MainWindow(QMainWindow):
     def _apply_crop(self, crop_rect: QRectF):
         if self._current_idx < 0 or not self._images:
             return
-        src = self._pending_image if self._pending_image is not None else \
-              QImage(str(self._images[self._current_idx]))
-        if src.isNull():
-            return
-        img_w, img_h = self._viewer.image_size
         cx, cy = crop_rect.x(), crop_rect.y()
         cw, ch = crop_rect.width(), crop_rect.height()
-        cropped = src.copy(int(round(cx)), int(round(cy)),
-                           int(round(cw)), int(round(ch)))
+
+        if self._nn_preview and self._pending_image is None:
+            # Viewer shows a letterboxed canvas. Map crop rect and annotations back
+            # to original image coordinates before cropping.
+            orig_pix = QPixmap(str(self._images[self._current_idx]))
+            if orig_pix.isNull():
+                return
+            _, sw, sh, pad_x, pad_y = self._make_letterbox(orig_pix, self._nn_size)
+            orig_w, orig_h = orig_pix.width(), orig_pix.height()
+            ox = max(0, int(round((cx - pad_x) * orig_w / sw)))
+            oy = max(0, int(round((cy - pad_y) * orig_h / sh)))
+            ow = min(int(round(cw * orig_w / sw)), orig_w - ox)
+            oh = min(int(round(ch * orig_h / sh)), orig_h - oy)
+            if ow <= 0 or oh <= 0:
+                return
+            orig_anns = self._unmap_anns_letterbox(
+                list(self._viewer.get_annotations()), sw, sh, pad_x, pad_y, self._nn_size)
+            new_anns = recalc_annotations_crop(orig_anns, orig_w, orig_h, ox, oy, ow, oh)
+            cropped = orig_pix.toImage().copy(ox, oy, ow, oh)
+        else:
+            src = self._pending_image if self._pending_image is not None else \
+                  QImage(str(self._images[self._current_idx]))
+            if src.isNull():
+                return
+            img_w, img_h = self._viewer.image_size
+            cropped = src.copy(int(round(cx)), int(round(cy)),
+                               int(round(cw)), int(round(ch)))
+            new_anns = recalc_annotations_crop(
+                list(self._viewer.get_annotations()), img_w, img_h, cx, cy, cw, ch)
+
         self._pending_image = cropped
-        current_anns = self._viewer.get_annotations()
-        new_anns = recalc_annotations_crop(
-            current_anns, img_w, img_h, cx, cy, cw, ch)
         classes = self._config.names if self._config else []
         self._viewer.reload_with_pixmap(QPixmap.fromImage(cropped), new_anns, classes)
         self._dirty = True
@@ -1804,8 +1843,20 @@ class MainWindow(QMainWindow):
         except OSError:
             sz = "?"
         undo_info = f"  ↩{len(self._undo_stack)}" if self._undo_stack else ""
+        name_display = _truncate_middle(name, _MAX_NAME_CHARS)
         self._status_lbl.setText(
-            f"{i}/{n}  {name}{marker}  {px_info}  {sz}{undo_info}")
+            f"{i}/{n}  {name_display}{marker}  {px_info}  {sz}{undo_info}")
+        self._status_lbl.setToolTip(str(path) if name_display != name else "")
+
+    def _update_dataset_path_display(self):
+        if not self._config:
+            return
+        folder = str(self._config.config_path.parent)
+        display = _truncate_middle(folder, _MAX_PATH_CHARS)
+        self._dataset_path_lbl.setText(display)
+        self._dataset_path_lbl.setToolTip(folder if display != folder else "")
+        self.setWindowTitle(
+            f"YOLO Annotator — {self._config.config_path.parent.name}")
 
     # ── Brightness / contrast ─────────────────────────────────────────────────
 
