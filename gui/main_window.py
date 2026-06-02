@@ -161,6 +161,7 @@ class MainWindow(QMainWindow):
         self._pre_mosaic_dirty: bool = False
         self._pre_mosaic_had_pending: bool = False
         self._pre_mosaic_nn_preview: bool = False
+        self._mosaic_save_anns: list | None = None
         self._mosaic_grid_size: int = 0
         self._current_browse_split = ""
         self._confirm_delete = True
@@ -921,6 +922,27 @@ class MainWindow(QMainWindow):
                 result.append(Annotation(ann.class_id, AnnType.SEGMENT, new_data))
         return result
 
+    def _unmap_anns_letterbox(self, anns, sw, sh, pad_x, pad_y, size):
+        """Inverse of _remap_anns_letterbox: letterboxed canvas coords → original image coords."""
+        from core.models import Annotation, AnnType
+        result = []
+        for ann in anns:
+            if ann.ann_type == AnnType.BBOX:
+                cx, cy, w, h = ann.data
+                result.append(Annotation(ann.class_id, AnnType.BBOX, [
+                    (cx * size - pad_x) / sw,
+                    (cy * size - pad_y) / sh,
+                    w * size / sw,
+                    h * size / sh,
+                ]))
+            else:
+                new_data = []
+                for i in range(0, len(ann.data), 2):
+                    new_data.append((ann.data[i]     * size - pad_x) / sw)
+                    new_data.append((ann.data[i + 1] * size - pad_y) / sh)
+                result.append(Annotation(ann.class_id, AnnType.SEGMENT, new_data))
+        return result
+
     def _on_nn_size_changed(self, value: int):
         self._nn_size = value
         self._save_settings()
@@ -929,7 +951,31 @@ class MainWindow(QMainWindow):
 
     def _on_nn_preview_toggled(self, checked: bool):
         self._nn_preview = checked
-        self._load_current_image()
+        if self._pre_mosaic_image is not None and self._pending_image is not None:
+            self._refresh_mosaic_nn_display()
+        else:
+            self._load_current_image()
+
+    def _refresh_mosaic_nn_display(self):
+        """Switch letterbox on/off for the current mosaic without discarding it."""
+        classes = self._config.names if self._config else []
+        # Proportional annotations: use stored ones, or capture from viewer on first NN-ON toggle.
+        if self._mosaic_save_anns is not None:
+            prop_anns = self._mosaic_save_anns
+        else:
+            prop_anns = list(self._viewer.get_annotations())
+            if self._nn_preview:
+                self._mosaic_save_anns = prop_anns
+        if self._nn_preview:
+            lb_pix, sw, sh, pad_x, pad_y = self._make_letterbox(
+                QPixmap.fromImage(self._pending_image), self._nn_size)
+            lb_anns = self._remap_anns_letterbox(prop_anns, sw, sh, pad_x, pad_y, self._nn_size)
+            self._viewer.reload_with_pixmap(lb_pix, lb_anns, classes)
+        else:
+            self._viewer.reload_with_pixmap(
+                QPixmap.fromImage(self._pending_image), prop_anns, classes)
+        self._rebuild_ann_list()
+        self._update_status()
 
     # ── Config history ────────────────────────────────────────────────────────
 
@@ -1147,6 +1193,7 @@ class MainWindow(QMainWindow):
         self._pre_mosaic_dirty = False
         self._pre_mosaic_had_pending = False
         self._pre_mosaic_nn_preview = False
+        self._mosaic_save_anns = None
         self._mosaic_grid_size = 0
         self._mosaic_btn.setToolTip("Мозаика 2×2 [M]")
         self._viewer.stop_crop_mode()
@@ -1189,12 +1236,27 @@ class MainWindow(QMainWindow):
         if self._current_idx < 0 or not self._images:
             return
         path = self._images[self._current_idx]
+        had_pending = self._pending_image is not None
         if self._pending_image is not None:
             self._pending_image.save(str(path))
             self._pending_image = None
         self._pre_mosaic_image = None
         self._pre_mosaic_anns = None
-        save_annotations(path, self._viewer.get_annotations())
+        if self._mosaic_save_anns is not None:
+            anns_to_save = self._mosaic_save_anns
+            self._mosaic_save_anns = None
+        elif self._nn_preview and not had_pending:
+            # Viewer holds letterboxed coords; unmap to original image space before saving.
+            pix = QPixmap(str(path))
+            if not pix.isNull():
+                _, sw, sh, pad_x, pad_y = self._make_letterbox(pix, self._nn_size)
+                anns_to_save = self._unmap_anns_letterbox(
+                    self._viewer.get_annotations(), sw, sh, pad_x, pad_y, self._nn_size)
+            else:
+                anns_to_save = self._viewer.get_annotations()
+        else:
+            anns_to_save = self._viewer.get_annotations()
+        save_annotations(path, anns_to_save)
         self._dirty = False
         self._viewer.scene().clearSelection()
         self._set_img_status(path, ImgStatus.SAVED)
@@ -1445,16 +1507,26 @@ class MainWindow(QMainWindow):
 
         N = self._mosaic_grid_size
         n_tiles = N * N
-        base_scale = 1.0 / N
-        # mosaic_step = total spread between smallest and largest tile (in % of src size)
-        # step per tile = spread / n_tiles  (per user spec: e.g. 20% / 4 tiles = 5%)
-        step = self._mosaic_step / 100.0 / n_tiles
 
         src_w = src.width()
         src_h = src.height()
-        out_w = out_h = self._nn_size if use_nn else None
-        if out_w is None:
+        if use_nn:
+            # Scale factors are expressed relative to the original src so that tiles are
+            # produced in a single resize step.  Multiplying base/step by nn_factor maps
+            # src coordinates to the proportional nn_size canvas without an intermediate
+            # pre-scale of the source image.
+            max_side = max(src_w, src_h)
+            nn_factor = self._nn_size / max_side
+            out_w = int(round(src_w * nn_factor))
+            out_h = int(round(src_h * nn_factor))
+            base_scale = nn_factor / N
+            step = self._mosaic_step / 100.0 / n_tiles * nn_factor
+        else:
             out_w, out_h = src_w, src_h
+            base_scale = 1.0 / N
+            # mosaic_step = total spread between smallest and largest tile (in % of src size)
+            # step per tile = spread / n_tiles  (per user spec: e.g. 20% / 4 tiles = 5%)
+            step = self._mosaic_step / 100.0 / n_tiles
 
         cell_w = out_w // N
         cell_h = out_h // N
@@ -1523,7 +1595,16 @@ class MainWindow(QMainWindow):
 
         self._pending_image = output
         classes = self._config.names if self._config else []
-        self._viewer.reload_with_pixmap(QPixmap.fromImage(output), all_anns, classes)
+        if use_nn:
+            # Save proportional mosaic; display with letterbox for visual consistency.
+            self._mosaic_save_anns = list(all_anns)
+            lb_pix, sw, sh, pad_x, pad_y = self._make_letterbox(
+                QPixmap.fromImage(output), self._nn_size)
+            lb_anns = self._remap_anns_letterbox(all_anns, sw, sh, pad_x, pad_y, self._nn_size)
+            self._viewer.reload_with_pixmap(lb_pix, lb_anns, classes)
+        else:
+            self._mosaic_save_anns = None
+            self._viewer.reload_with_pixmap(QPixmap.fromImage(output), all_anns, classes)
         self._dirty = True
         self._save_btn.setEnabled(True)
         self._rebuild_ann_list()
@@ -1551,6 +1632,7 @@ class MainWindow(QMainWindow):
         self._pre_mosaic_had_pending = False
         self._pre_mosaic_nn_preview = False
         self._mosaic_grid_size = 0
+        self._mosaic_save_anns = None
         self._mosaic_btn.setToolTip("Мозаика 2×2 [M]")
         if was_nn_preview:
             # Restore letterbox display: re-apply letterbox transform to original annotations.
