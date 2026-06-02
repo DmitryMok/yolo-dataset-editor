@@ -1441,28 +1441,33 @@ class MainWindow(QMainWindow):
         cell_w = out_w // N
         cell_h = out_h // N
 
-        def _visible_area(anns, scale, crx, cry):
-            total = 0.0
-            sw = src_w * scale
-            sh = src_h * scale
+        def _optimal_crop(overflow, anns, scale, src_dim, cell_dim, coord_idx):
+            """Crop offset that centers annotation union bbox in cell."""
+            if overflow <= 0 or not anns:
+                return 0.0
+            scaled_dim = src_dim * scale
+            lo, hi = float('inf'), float('-inf')
             for ann in anns:
                 if ann.ann_type == AnnType.BBOX:
                     ncx, ncy, nw, nh = ann.data
-                    x1 = (ncx - nw / 2) * sw - crx
-                    x2 = (ncx + nw / 2) * sw - crx
-                    y1 = (ncy - nh / 2) * sh - cry
-                    y2 = (ncy + nh / 2) * sh - cry
-                    vis_w = max(0.0, min(x2, cell_w) - max(x1, 0.0))
-                    vis_h = max(0.0, min(y2, cell_h) - max(y1, 0.0))
-                    total += vis_w * vis_h
+                    if coord_idx == 0:
+                        a = (ncx - nw / 2) * scaled_dim
+                        b = (ncx + nw / 2) * scaled_dim
+                    else:
+                        a = (ncy - nh / 2) * scaled_dim
+                        b = (ncy + nh / 2) * scaled_dim
                 else:
-                    xs = [ann.data[i] * sw - crx for i in range(0, len(ann.data), 2)]
-                    ys = [ann.data[i] * sh - cry for i in range(1, len(ann.data), 2)]
-                    if xs and ys:
-                        vis_w = max(0.0, min(max(xs), cell_w) - max(min(xs), 0.0))
-                        vis_h = max(0.0, min(max(ys), cell_h) - max(min(ys), 0.0))
-                        total += vis_w * vis_h
-            return total
+                    vals = [ann.data[i] * scaled_dim
+                            for i in range(coord_idx, len(ann.data), 2)]
+                    if not vals:
+                        continue
+                    a, b = min(vals), max(vals)
+                lo = min(lo, a)
+                hi = max(hi, b)
+            if lo == float('inf'):
+                return 0.0
+            ideal = (lo + hi) / 2.0 - cell_dim / 2.0
+            return max(0.0, min(float(overflow), ideal))
 
         output = QImage(out_w, out_h, QImage.Format.Format_RGB32)
         output.fill(Qt.GlobalColor.black)
@@ -1477,30 +1482,13 @@ class MainWindow(QMainWindow):
                 scale = base_scale + scale_idx * step
                 cell_x = col * cell_w
                 cell_y = row * cell_h
-                outer_left = (col == 0)
-                outer_top  = (row == 0)
-
                 scaled_w = int(round(scale * src_w))
                 scaled_h = int(round(scale * src_h))
                 overflow_x = max(0, scaled_w - cell_w)
                 overflow_y = max(0, scaled_h - cell_h)
 
-                default_cx = overflow_x if outer_left else 0
-                default_cy = overflow_y if outer_top  else 0
-                alt_cx = 0 if outer_left else overflow_x
-                alt_cy = 0 if outer_top  else overflow_y
-
-                crop_x = default_cx
-                if overflow_x > 0 and current_anns:
-                    if _visible_area(current_anns, scale, alt_cx, default_cy) > \
-                       _visible_area(current_anns, scale, default_cx, default_cy):
-                        crop_x = alt_cx
-
-                crop_y = default_cy
-                if overflow_y > 0 and current_anns:
-                    if _visible_area(current_anns, scale, crop_x, alt_cy) > \
-                       _visible_area(current_anns, scale, crop_x, default_cy):
-                        crop_y = alt_cy
+                crop_x = _optimal_crop(overflow_x, current_anns, scale, src_w, cell_w, 0)
+                crop_y = _optimal_crop(overflow_y, current_anns, scale, src_h, cell_h, 1)
 
                 scaled_img = src.scaled(scaled_w, scaled_h,
                                         Qt.AspectRatioMode.IgnoreAspectRatio,
