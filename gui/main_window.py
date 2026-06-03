@@ -379,7 +379,7 @@ class MainWindow(QMainWindow):
         z3l.setContentsMargins(8, 0, 12, 0)
         z3l.setSpacing(10)
 
-        self._autosave_cb = QCheckBox("Autosave")
+        self._autosave_cb = QCheckBox("Автосохранение")
         self._autosave_cb.setFixedHeight(22)
         self._autosave_cb.setToolTip(
             "Автоматически сохранять при переходе между изображениями")
@@ -656,7 +656,8 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(4, 4, 4, 4)
         lay.setSpacing(6)
 
-        ann_group = QGroupBox("Аннотации")
+        ann_group = QGroupBox("АННОТАЦИИ")
+        ann_group.setObjectName("ann-group")
         ag = QVBoxLayout(ann_group)
         ag.setContentsMargins(4, 6, 4, 4)
         ag.setSpacing(4)
