@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QTimer, QRectF, QPoint, QPointF, QEvent, QSize
 from PyQt6.QtGui import (QAction, QKeySequence, QShortcut, QColor,
-                          QIcon, QPixmap, QImage, QTransform, QCursor)
+                          QIcon, QPixmap, QImage, QTransform, QCursor, QPainter)
 
 from core.config_io import DatasetConfig
 from core.annotation_io import load_annotations, save_annotations, get_images, get_label_path
