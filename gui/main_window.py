@@ -656,7 +656,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(4, 4, 4, 4)
         lay.setSpacing(6)
 
-        ann_group = QGroupBox("Annotations")
+        ann_group = QGroupBox("Аннотации")
         ag = QVBoxLayout(ann_group)
         ag.setContentsMargins(4, 6, 4, 4)
         ag.setSpacing(4)
