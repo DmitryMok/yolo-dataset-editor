@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
 from PyQt6.QtCore import pyqtSignal, Qt, QRectF, QPointF
 from PyQt6.QtGui import QPixmap, QPen, QBrush, QColor, QPainter, QImage
 
-from core.models import Annotation, AnnType
+from core.models import Annotation, AnnType, IMAGE_EXTENSIONS
 from gui.editor.items import BBoxItem, SegmentItem, class_color, get_label_px, set_label_px
 
 _CROSS_PEN = QPen(QColor(255, 255, 255, 200), 1, Qt.PenStyle.DashLine)
@@ -174,6 +174,7 @@ class ImageViewer(QGraphicsView):
     crop_confirmed            = pyqtSignal(QRectF)
     crop_cancelled            = pyqtSignal()
     segment_convert_requested = pyqtSignal(object)   # passes the SegmentItem
+    files_dropped             = pyqtSignal(list)      # List[Path]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -188,6 +189,8 @@ class ImageViewer(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setBackgroundBrush(QBrush(QColor(40, 40, 40)))
         self.setMouseTracking(True)
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
 
         self._pixmap_item: QGraphicsPixmapItem | None = None
         self._img_w = 1
@@ -647,6 +650,33 @@ class ImageViewer(QGraphicsView):
     @property
     def image_size(self) -> tuple[int, int]:
         return self._img_w, self._img_h
+
+    def _has_image_urls(self, event) -> bool:
+        if not event.mimeData().hasUrls():
+            return False
+        from pathlib import Path
+        return any(Path(u.toLocalFile()).suffix.lower() in IMAGE_EXTENSIONS
+                   for u in event.mimeData().urls())
+
+    def dragEnterEvent(self, event):
+        if self._has_image_urls(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._has_image_urls(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        from pathlib import Path
+        paths = [Path(u.toLocalFile()) for u in event.mimeData().urls()
+                 if Path(u.toLocalFile()).suffix.lower() in IMAGE_EXTENSIONS]
+        if paths:
+            self.files_dropped.emit(paths)
+            event.acceptProposedAction()
 
     def leaveEvent(self, event):
         if self._cross_h:

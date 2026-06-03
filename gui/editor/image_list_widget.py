@@ -5,6 +5,8 @@ from PyQt6.QtWidgets import QListWidget, QLabel
 from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal, QThread
 from PyQt6.QtGui import QIcon, QPixmap, QImage, QColor
 
+from core.models import IMAGE_EXTENSIONS
+
 
 class _IconLoader(QThread):
     """Loads small list icons in background using QImage (thread-safe)."""
@@ -75,6 +77,7 @@ class _PreviewLoader(QThread):
 class ImageListWidget(QListWidget):
     ICON_W = 24
     ICON_H = 18
+    files_dropped = pyqtSignal(list)  # List[Path]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -88,6 +91,8 @@ class ImageListWidget(QListWidget):
 
         self.setIconSize(QSize(self.ICON_W, self.ICON_H))
         self.setMouseTracking(True)
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
 
         pix = QPixmap(self.ICON_W, self.ICON_H)
         pix.fill(QColor(50, 52, 58))
@@ -222,6 +227,31 @@ class ImageListWidget(QListWidget):
     def hideEvent(self, event):
         self._preview_lbl.hide()
         super().hideEvent(event)
+
+    def _has_image_urls(self, event) -> bool:
+        if not event.mimeData().hasUrls():
+            return False
+        return any(Path(u.toLocalFile()).suffix.lower() in IMAGE_EXTENSIONS
+                   for u in event.mimeData().urls())
+
+    def dragEnterEvent(self, event):
+        if self._has_image_urls(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._has_image_urls(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        paths = [Path(u.toLocalFile()) for u in event.mimeData().urls()
+                 if Path(u.toLocalFile()).suffix.lower() in IMAGE_EXTENSIONS]
+        if paths:
+            self.files_dropped.emit(paths)
+            event.acceptProposedAction()
 
     def remove_path(self, index: int):
         """Remove one entry without restarting the icon loader."""

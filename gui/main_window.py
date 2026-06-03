@@ -2,6 +2,7 @@ import os
 import shutil
 import json
 from collections import deque
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import List
@@ -20,6 +21,7 @@ from PyQt6.QtGui import (QAction, QKeySequence, QShortcut, QColor,
 
 from core.config_io import DatasetConfig
 from core.annotation_io import load_annotations, save_annotations, get_images, get_label_path
+from core.models import IMAGE_EXTENSIONS
 from core.image_ops import (recalc_annotations_crop, recalc_annotations_rotate,
                             recalc_annotations_mosaic)
 from core.folder_detect import detect_folder, execute_normalization
@@ -176,6 +178,89 @@ class _HistoryItem(QLabel):
         # Trigger hovered signal so _on_history_hovered updates all labels
         self._menu.setActiveAction(self._action)
         super().enterEvent(event)
+
+
+# ─── File conflict dialog ─────────────────────────────────────────────────────
+
+class _FileConflictDialog(QDialog):
+    REPLACE = 0
+    RENAME  = 1
+    SKIP    = 2
+
+    def __init__(self, existing_path: Path, new_path: Path, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Файл уже существует")
+        self.setModal(True)
+        self.setMinimumWidth(440)
+        self._result = self.SKIP
+
+        layout = QVBoxLayout(self)
+
+        def _fmt_info(p: Path) -> str:
+            try:
+                stat = p.stat()
+                size = stat.st_size
+                mtime = datetime.fromtimestamp(stat.st_mtime).strftime("%d.%m.%Y %H:%M")
+                if size >= 1_048_576:
+                    sz = f"{size / 1_048_576:.1f} МБ"
+                elif size >= 1024:
+                    sz = f"{size / 1024:.0f} КБ"
+                else:
+                    sz = f"{size} Б"
+            except Exception:
+                sz, mtime = "?", "?"
+            return sz, mtime
+
+        def _fmt_dims(p: Path) -> str:
+            try:
+                from PyQt6.QtGui import QImageReader
+                r = QImageReader(str(p))
+                s = r.size()
+                if s.isValid():
+                    return f"{s.width()}×{s.height()} px"
+            except Exception:
+                pass
+            return ""
+
+        ex_sz, ex_mt = _fmt_info(existing_path)
+        nw_sz, nw_mt = _fmt_info(new_path)
+        nw_dims = _fmt_dims(new_path)
+
+        ex_group = QGroupBox("Существующий файл")
+        ex_form = QFormLayout(ex_group)
+        ex_form.addRow("Имя:",      QLabel(existing_path.name))
+        ex_form.addRow("Размер:",   QLabel(ex_sz))
+        ex_form.addRow("Изменён:",  QLabel(ex_mt))
+        layout.addWidget(ex_group)
+
+        nw_group = QGroupBox("Новый файл")
+        nw_form = QFormLayout(nw_group)
+        nw_form.addRow("Имя:",      QLabel(new_path.name))
+        nw_form.addRow("Размер:",   QLabel(nw_sz))
+        nw_form.addRow("Изменён:",  QLabel(nw_mt))
+        if nw_dims:
+            nw_form.addRow("Разрешение:", QLabel(nw_dims))
+        layout.addWidget(nw_group)
+
+        layout.addSpacing(8)
+        btn_row = QHBoxLayout()
+        btn_replace = QPushButton("Заменить")
+        btn_rename  = QPushButton("Переименовать")
+        btn_skip    = QPushButton("Пропустить")
+        btn_replace.clicked.connect(lambda: self._finish(self.REPLACE))
+        btn_rename.clicked.connect(lambda: self._finish(self.RENAME))
+        btn_skip.clicked.connect(lambda: self._finish(self.SKIP))
+        btn_row.addWidget(btn_replace)
+        btn_row.addWidget(btn_rename)
+        btn_row.addWidget(btn_skip)
+        layout.addLayout(btn_row)
+
+    def _finish(self, result: int):
+        self._result = result
+        self.accept()
+
+    def chosen(self) -> int:
+        return self._result
 
 
 # ─── Main window ──────────────────────────────────────────────────────────────
@@ -432,6 +517,7 @@ class MainWindow(QMainWindow):
         self._viewer.crop_cancelled.connect(self._on_crop_cancelled)
         self._viewer.segment_convert_requested.connect(self._on_segment_double_click)
         self._viewer.scene().selectionChanged.connect(self._on_scene_selection_changed)
+        self._viewer.files_dropped.connect(self._on_files_dropped)
 
         vlay.addWidget(self._viewer, 1)
         return center
@@ -643,6 +729,7 @@ class MainWindow(QMainWindow):
         self._image_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._image_list.customContextMenuRequested.connect(
             self._on_image_list_context_menu)
+        self._image_list.files_dropped.connect(self._on_files_dropped)
         lay.addWidget(self._image_list)
 
         panel.setMinimumWidth(170)
@@ -2106,6 +2193,79 @@ class MainWindow(QMainWindow):
         else:  # SAVED
             item.setForeground(QColor(160, 230, 160))
             item.setBackground(QColor(15, 45, 15))
+
+    def _on_files_dropped(self, paths: list):
+        if not self._config or not self._current_browse_split:
+            return
+        split_dir = self._config.splits.get(self._current_browse_split)
+        if not split_dir:
+            return
+
+        from PyQt6.QtGui import QImageReader
+        last_added_idx = None
+
+        for src_path in paths:
+            src_path = Path(src_path)
+            if src_path.suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+
+            reader = QImageReader(str(src_path))
+            if not reader.canRead():
+                QMessageBox.warning(
+                    self, "Ошибка открытия",
+                    f"Не удалось открыть файл как изображение:\n{src_path.name}")
+                continue
+
+            dst_path = split_dir / src_path.name
+            replacing_existing = dst_path in self._images
+
+            if dst_path.exists():
+                dlg = _FileConflictDialog(dst_path, src_path, self)
+                dlg.exec()
+                choice = dlg.chosen()
+                if choice == _FileConflictDialog.SKIP:
+                    continue
+                elif choice == _FileConflictDialog.RENAME:
+                    stem, suffix = src_path.stem, src_path.suffix
+                    n = 1
+                    while True:
+                        dst_path = split_dir / f"{stem}_{n}{suffix}"
+                        if not dst_path.exists():
+                            break
+                        n += 1
+                    replacing_existing = False
+
+            try:
+                split_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src_path), str(dst_path))
+            except Exception as e:
+                QMessageBox.critical(
+                    self, "Ошибка копирования",
+                    f"Не удалось скопировать файл:\n{e}")
+                continue
+
+            if replacing_existing:
+                # File already in list — just navigate to it
+                idx = self._images.index(dst_path)
+                self._set_img_status(dst_path, ImgStatus.UNVIEWED)
+                last_added_idx = idx
+            else:
+                # Insert at sorted position
+                new_idx = len(self._images)
+                for i, p in enumerate(self._images):
+                    if dst_path.name < p.name:
+                        new_idx = i
+                        break
+                self._images.insert(new_idx, dst_path)
+                self._image_list.blockSignals(True)
+                self._image_list.insertItem(new_idx, dst_path.name)
+                self._image_list.blockSignals(False)
+                self._image_list.insert_path(new_idx, dst_path)
+                self._apply_status_color(new_idx)
+                last_added_idx = new_idx
+
+        if last_added_idx is not None:
+            self._navigate_to(last_added_idx)
 
     def _on_image_list_context_menu(self, pos: QPoint):
         item = self._image_list.itemAt(pos)
