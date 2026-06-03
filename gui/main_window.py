@@ -74,6 +74,39 @@ def _svg_icon(name: str, size: int = 16, color: str = "#c2c4c9") -> "QIcon | Non
     return QIcon(pix)
 
 
+def _png_icon(path: Path, size: int = 16, color: str = "#c2c4c9") -> "QIcon | None":
+    """Load PNG, make white background transparent, tint to color."""
+    img = QImage(str(path))
+    if img.isNull():
+        return None
+    img = img.convertToFormat(QImage.Format.Format_ARGB32)
+    h = color.lstrip("#")
+    tr, tg, tb = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    ptr = img.bits()
+    ptr.setsize(img.sizeInBytes())
+    buf = bytearray(bytes(ptr))
+    for i in range(0, len(buf), 4):           # BGRA on little-endian
+        b, g, r = buf[i], buf[i + 1], buf[i + 2]
+        brightness = (r + g + b) // 3
+        alpha = max(0, 255 - brightness)       # white→transparent, dark→opaque
+        buf[i], buf[i + 1], buf[i + 2], buf[i + 3] = tb, tg, tr, alpha
+    buf_bytes = bytes(buf)
+    colored = QImage(buf_bytes, img.width(), img.height(),
+                     img.bytesPerLine(), QImage.Format.Format_ARGB32).copy()
+    pix = QPixmap.fromImage(colored).scaled(
+        size, size,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation)
+    out = QPixmap(size, size)
+    out.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(out)
+    painter.drawPixmap((size - pix.width()) // 2, (size - pix.height()) // 2, pix)
+    painter.end()
+    return QIcon(out)
+
+
+_ICONS_DIR = Path(__file__).parent / "icons"
+
 HISTORY_FILE   = Path.home() / '.yololabel_history.json'
 HISTORY_LIMIT  = 10
 SETTINGS_FILE  = Path.home() / '.yololabel_settings.json'
@@ -346,7 +379,8 @@ class MainWindow(QMainWindow):
                      app_style.standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon))
         ic_undo   = _svg_icon("undo")
         ic_redo   = _svg_icon("redo")
-        ic_gear   = _svg_icon("gear")
+        ic_gear   = (_png_icon(_ICONS_DIR / "settings.png", size=16)
+                     or _svg_icon("gear"))
 
         tb = QWidget()
         tb.setObjectName("toolbar")
@@ -743,8 +777,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(4, 4, 4, 4)
         lay.setSpacing(6)
 
-        ann_group = QGroupBox("АННОТАЦИИ")
-        ann_group.setObjectName("ann-group")
+        ann_group = QGroupBox("Аннотации")
         ag = QVBoxLayout(ann_group)
         ag.setContentsMargins(4, 6, 4, 4)
         ag.setSpacing(4)
@@ -753,6 +786,7 @@ class MainWindow(QMainWindow):
         self._draw_btn.setCheckable(True)
         self._draw_btn.setToolTip("Нарисовать bounding box [Пробел]")
         self._draw_btn.toggled.connect(self._on_draw_mode_toggled)
+        self._draw_btn.setEnabled(False)
         ag.addWidget(self._draw_btn)
 
         self._ann_list = QListWidget()
@@ -761,7 +795,7 @@ class MainWindow(QMainWindow):
         self._ann_list.itemDoubleClicked.connect(self._on_ann_list_double_click)
         ag.addWidget(self._ann_list)
 
-        ag.addWidget(QLabel("Class:"))
+        ag.addWidget(QLabel("Класс:"))
         self._class_combo = QComboBox()
         self._class_combo.currentIndexChanged.connect(self._on_class_combo_changed)
         self._class_combo.setEnabled(False)
@@ -782,7 +816,7 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(ann_group, 1)
 
-        img_group = QGroupBox("Image")
+        img_group = QGroupBox("Изображение")
         ig = QVBoxLayout(img_group)
         ig.setContentsMargins(4, 6, 4, 4)
         ig.setSpacing(4)
@@ -792,12 +826,13 @@ class MainWindow(QMainWindow):
         cm_lay.setContentsMargins(0, 0, 0, 0)
         cm_lay.setSpacing(4)
 
-        self._crop_btn = QPushButton("✂")
+        self._crop_btn = QPushButton("✂ Обрезать")
         self._crop_btn.setCheckable(True)
         self._crop_btn.setToolTip("Обрезать [X]")
         self._crop_btn.toggled.connect(self._on_crop_btn)
+        self._crop_btn.setEnabled(False)
 
-        self._mosaic_btn = QPushButton("⊞ Mosaic  [M]")
+        self._mosaic_btn = QPushButton("⊞ Мозаика  [M]")
         self._mosaic_btn.setToolTip("Мозаика 2×2 из текущего изображения [M]")
         self._mosaic_btn.clicked.connect(self._apply_mosaic)
         self._mosaic_btn.setEnabled(False)
@@ -810,14 +845,16 @@ class MainWindow(QMainWindow):
         rot_lay = QHBoxLayout(rot_row)
         rot_lay.setContentsMargins(0, 0, 0, 0)
         rot_lay.setSpacing(4)
-        btn_cw = QPushButton("↻ CW  [R]")
-        btn_cw.setToolTip("Повернуть по часовой стрелке [R]")
-        btn_cw.clicked.connect(lambda: self._rotate_image(clockwise=True))
-        btn_ccw = QPushButton("↺ CCW  [⇧R]")
-        btn_ccw.setToolTip("Повернуть против часовой стрелки [Shift+R]")
-        btn_ccw.clicked.connect(lambda: self._rotate_image(clockwise=False))
-        rot_lay.addWidget(btn_cw)
-        rot_lay.addWidget(btn_ccw)
+        self._rotate_cw_btn = QPushButton("↻ CW  [R]")
+        self._rotate_cw_btn.setToolTip("Повернуть по часовой стрелке [R]")
+        self._rotate_cw_btn.clicked.connect(lambda: self._rotate_image(clockwise=True))
+        self._rotate_cw_btn.setEnabled(False)
+        self._rotate_ccw_btn = QPushButton("↺ CCW  [⇧R]")
+        self._rotate_ccw_btn.setToolTip("Повернуть против часовой стрелки [Shift+R]")
+        self._rotate_ccw_btn.clicked.connect(lambda: self._rotate_image(clockwise=False))
+        self._rotate_ccw_btn.setEnabled(False)
+        rot_lay.addWidget(self._rotate_cw_btn)
+        rot_lay.addWidget(self._rotate_ccw_btn)
         ig.addWidget(rot_row)
 
         def _slider_row(label: str) -> tuple:
@@ -826,11 +863,12 @@ class MainWindow(QMainWindow):
             rl.setContentsMargins(0, 0, 0, 0)
             rl.setSpacing(4)
             lbl = QLabel(label)
-            lbl.setFixedWidth(12)
+            lbl.setFixedWidth(14)
             sl = QSlider(Qt.Orientation.Horizontal)
             sl.setRange(-100, 100)
             sl.setValue(0)
             sl.setTickInterval(50)
+            sl.setEnabled(False)
             val_lbl = QLabel("0")
             val_lbl.setFixedWidth(28)
             val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -839,8 +877,8 @@ class MainWindow(QMainWindow):
             rl.addWidget(val_lbl)
             return row, sl, val_lbl
 
-        bright_row, self._bright_sl, self._bright_val = _slider_row("B")
-        contr_row,  self._contr_sl,  self._contr_val  = _slider_row("C")
+        bright_row, self._bright_sl, self._bright_val = _slider_row("Я")
+        contr_row,  self._contr_sl,  self._contr_val  = _slider_row("К")
         self._bright_sl.valueChanged.connect(self._on_bc_changed)
         self._contr_sl.valueChanged.connect(self._on_bc_changed)
         self._bright_sl.valueChanged.connect(
@@ -1323,6 +1361,7 @@ class MainWindow(QMainWindow):
         self._save_btn.setEnabled(False)
         self._dup_btn.setEnabled(False)
         self._del_file_btn.setEnabled(False)
+        self._set_image_controls_enabled(False)
         self._update_status()
         self._update_assign_row()
 
@@ -1376,6 +1415,7 @@ class MainWindow(QMainWindow):
         self._mosaic_save_anns = None
         self._mosaic_grid_size = 0
         self._mosaic_btn.setToolTip("Мозаика 2×2 [M]")
+        self._set_image_controls_enabled(True)
         self._viewer.stop_crop_mode()
         self._crop_btn.setChecked(False)
         path = self._images[self._current_idx]
@@ -1975,6 +2015,7 @@ class MainWindow(QMainWindow):
             self._save_btn.setEnabled(False)
             self._dup_btn.setEnabled(False)
             self._del_file_btn.setEnabled(False)
+            self._set_image_controls_enabled(False)
             self._update_status()
             self._update_assign_row()
 
@@ -2193,6 +2234,19 @@ class MainWindow(QMainWindow):
         else:  # SAVED
             item.setForeground(QColor(160, 230, 160))
             item.setBackground(QColor(15, 45, 15))
+
+    def _set_image_controls_enabled(self, enabled: bool):
+        self._draw_btn.setEnabled(enabled)
+        if not enabled and self._draw_btn.isChecked():
+            self._draw_btn.setChecked(False)
+        self._crop_btn.setEnabled(enabled)
+        if not enabled and self._crop_btn.isChecked():
+            self._crop_btn.setChecked(False)
+        self._mosaic_btn.setEnabled(enabled)
+        self._rotate_cw_btn.setEnabled(enabled)
+        self._rotate_ccw_btn.setEnabled(enabled)
+        self._bright_sl.setEnabled(enabled)
+        self._contr_sl.setEnabled(enabled)
 
     def _on_files_dropped(self, paths: list):
         if not self._config or not self._current_browse_split:
@@ -2449,5 +2503,6 @@ class MainWindow(QMainWindow):
             self._save_btn.setEnabled(False)
             self._dup_btn.setEnabled(False)
             self._del_file_btn.setEnabled(False)
+            self._set_image_controls_enabled(False)
             self._update_status()
             self._update_assign_row()

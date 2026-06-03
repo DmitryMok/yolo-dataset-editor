@@ -418,11 +418,6 @@ QGroupBox::title {{
     color: {TEXT_DIM};
 }}
 
-QGroupBox#ann-group {{
-    font-size: 10px;
-    letter-spacing: 0.5px;
-}}
-
 /* ── Menu ────────────────────────────────────────────────── */
 QMenu {{
     background: {PANEL2};
