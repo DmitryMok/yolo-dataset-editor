@@ -1373,13 +1373,17 @@ class MainWindow(QMainWindow):
 
     def _on_pre_edit_started(self):
         if not self._in_undo:
-            self._pre_edit_state = self._viewer.get_annotations()
+            self._pre_edit_state = {"image": self._pending_image,
+                                    "anns": self._viewer.get_annotations()}
 
-    def _push_undo(self, state: list):
+    def _push_undo(self, state):
         self._undo_stack.append(state)
         self._redo_stack.clear()
         self._undo_btn.setEnabled(True)
         self._redo_btn.setEnabled(False)
+
+    def _current_full_state(self):
+        return {"image": self._pending_image, "anns": self._viewer.get_annotations()}
 
     def _undo(self):
         if self._pre_mosaic_image is not None:
@@ -1387,7 +1391,7 @@ class MainWindow(QMainWindow):
             return
         if not self._undo_stack:
             return
-        self._redo_stack.append(self._viewer.get_annotations())
+        self._redo_stack.append(self._current_full_state())
         state = self._undo_stack.pop()
         self._restore(state)
         self._undo_btn.setEnabled(bool(self._undo_stack))
@@ -1396,16 +1400,34 @@ class MainWindow(QMainWindow):
     def _redo(self):
         if not self._redo_stack:
             return
-        self._undo_stack.append(self._viewer.get_annotations())
+        self._undo_stack.append(self._current_full_state())
         state = self._redo_stack.pop()
         self._restore(state)
         self._undo_btn.setEnabled(True)
         self._redo_btn.setEnabled(bool(self._redo_stack))
 
-    def _restore(self, state: list):
+    def _restore(self, state):
         self._in_undo = True
         classes = self._config.names if self._config else []
-        self._viewer.restore_annotations(state, classes)
+        if isinstance(state, dict):
+            saved_image = state["image"]
+            anns = state["anns"]
+        else:
+            saved_image = self._pending_image  # legacy list — treat as annotation-only
+            anns = state
+        if saved_image is not self._pending_image:
+            self._pending_image = saved_image
+            if saved_image is not None:
+                pix = QPixmap.fromImage(saved_image)
+            elif self._nn_preview:
+                disk_pix = QPixmap(str(self._images[self._current_idx]))
+                pix, *_ = self._make_letterbox(disk_pix, self._nn_size) \
+                    if not disk_pix.isNull() else (disk_pix,)
+            else:
+                pix = QPixmap(str(self._images[self._current_idx]))
+            self._viewer.reload_with_pixmap(pix, anns, classes)
+        else:
+            self._viewer.restore_annotations(anns, classes)
         self._in_undo = False
         self._rebuild_ann_list()
         self._dirty = True
@@ -1538,12 +1560,14 @@ class MainWindow(QMainWindow):
             new_anns = recalc_annotations_crop(
                 list(self._viewer.get_annotations()), img_w, img_h, cx, cy, cw, ch)
 
+        pre_crop_state = {"image": self._pending_image,
+                          "anns": list(self._viewer.get_annotations())}
         self._pending_image = cropped
         classes = self._config.names if self._config else []
         self._viewer.reload_with_pixmap(QPixmap.fromImage(cropped), new_anns, classes)
         self._dirty = True
         self._save_btn.setEnabled(True)
-        self._clear_undo()
+        self._push_undo(pre_crop_state)
         self._rebuild_ann_list()
         self._update_status()
 
@@ -1852,7 +1876,8 @@ class MainWindow(QMainWindow):
     # ── Annotation actions ────────────────────────────────────────────────────
 
     def _capture_for_undo(self):
-        self._pre_edit_state = self._viewer.get_annotations()
+        self._pre_edit_state = {"image": self._pending_image,
+                                "anns": self._viewer.get_annotations()}
 
     def _on_annotation_changed(self):
         if self._in_undo:
