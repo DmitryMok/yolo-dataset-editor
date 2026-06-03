@@ -87,36 +87,39 @@ class ImgStatus(Enum):
 class SettingsDialog(QDialog):
     def __init__(self, current: dict, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Settings")
+        self.setWindowTitle("Настройки")
         self.setModal(True)
         self.setFixedSize(320, 265)
         layout = QVBoxLayout(self)
 
-        mouse_group = QGroupBox("Mouse buttons")
+        mouse_group = QGroupBox("Кнопки мыши")
         mg = QFormLayout(mouse_group)
         self._pan_combo = QComboBox()
-        self._pan_combo.addItems(["Right button", "Middle button"])
+        self._pan_combo.addItems(["Правая кнопка", "Средняя кнопка"])
         self._pan_combo.setCurrentIndex(0 if current.get("pan_button","right") == "right" else 1)
-        mg.addRow("Pan image:", self._pan_combo)
+        self._pan_combo.setToolTip("Перемещение изображения в области просмотра")
+        mg.addRow("Перемещать:", self._pan_combo)
         self._fit_combo = QComboBox()
-        self._fit_combo.addItems(["Middle button", "Right button"])
+        self._fit_combo.addItems(["Средняя кнопка", "Правая кнопка"])
         self._fit_combo.setCurrentIndex(0 if current.get("fit_button","middle") == "middle" else 1)
-        mg.addRow("Fit to view:", self._fit_combo)
+        self._fit_combo.setToolTip("Выровнять изображение в области просмотра")
+        mg.addRow("Выровнять:", self._fit_combo)
         layout.addWidget(mouse_group)
 
-        edit_group = QGroupBox("Editing")
+        edit_group = QGroupBox("Редактирование")
         eg = QFormLayout(edit_group)
         self._confirm_del_cb = QCheckBox()
         self._confirm_del_cb.setChecked(current.get("confirm_delete", True))
-        eg.addRow("Confirm file delete:", self._confirm_del_cb)
+        self._confirm_del_cb.setToolTip("Подтверждать удаление файла")
+        eg.addRow("Подтверждать удаление:", self._confirm_del_cb)
 
         self._mosaic_step_spin = QSpinBox()
         self._mosaic_step_spin.setRange(1, 100)
         self._mosaic_step_spin.setValue(current.get("mosaic_step", 20))
         self._mosaic_step_spin.setSuffix(" %")
         self._mosaic_step_spin.setToolTip(
-            "Шаг масштаба между тайлами мозаики (% от базового 0.5×)")
-        eg.addRow("Mosaic scale step:", self._mosaic_step_spin)
+            "Разница масштаба между минимальным и максимальным размером объекта")
+        eg.addRow("Шаг мозаики:", self._mosaic_step_spin)
         layout.addWidget(edit_group)
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
@@ -208,6 +211,8 @@ class MainWindow(QMainWindow):
         self._redo_stack: deque = deque(maxlen=self.UNDO_LIMIT)
         self._pre_edit_state: list | None = None
         self._in_undo = False
+        self._split_undo_stack: list[dict] = []
+        self._split_redo_stack: list[dict] = []
 
         self._img_status: dict[str, ImgStatus] = {}
         self._load_progress()
@@ -611,7 +616,7 @@ class MainWindow(QMainWindow):
             self._dup_btn.setText("⧉")
         self._dup_btn.setObjectName("panel-head-btn")
         self._dup_btn.setFixedSize(24, 22)
-        self._dup_btn.setToolTip("Дублировать изображение")
+        self._dup_btn.setToolTip("Дублировать изображение [C]")
         self._dup_btn.clicked.connect(self._duplicate_current_image)
         self._dup_btn.setEnabled(False)
 
@@ -656,7 +661,7 @@ class MainWindow(QMainWindow):
         ag.setContentsMargins(4, 6, 4, 4)
         ag.setSpacing(4)
 
-        self._draw_btn = QPushButton("✏ Draw BBox")
+        self._draw_btn = QPushButton("✏ Рамка  [Пробел]")
         self._draw_btn.setCheckable(True)
         self._draw_btn.setToolTip("Нарисовать bounding box [Пробел]")
         self._draw_btn.toggled.connect(self._on_draw_mode_toggled)
@@ -674,13 +679,13 @@ class MainWindow(QMainWindow):
         self._class_combo.setEnabled(False)
         ag.addWidget(self._class_combo)
 
-        self._convert_btn = QPushButton("Convert → BBox")
+        self._convert_btn = QPushButton("→ BBox")
         self._convert_btn.setToolTip("Конвертировать выбранные сегментации в bbox")
         self._convert_btn.clicked.connect(self._on_convert_to_bbox)
         self._convert_btn.setEnabled(False)
         ag.addWidget(self._convert_btn)
 
-        self._delete_btn = QPushButton("Delete Annotation(s)")
+        self._delete_btn = QPushButton("Удалить рамку  [Del]")
         self._delete_btn.setObjectName("danger-btn")
         self._delete_btn.setToolTip("Удалить выбранные рамки / сегментации [Del]")
         self._delete_btn.clicked.connect(self._on_delete)
@@ -699,9 +704,9 @@ class MainWindow(QMainWindow):
         cm_lay.setContentsMargins(0, 0, 0, 0)
         cm_lay.setSpacing(4)
 
-        self._crop_btn = QPushButton("✂ Crop  [X]")
+        self._crop_btn = QPushButton("✂")
         self._crop_btn.setCheckable(True)
-        self._crop_btn.setToolTip("Режим кадрирования [X]")
+        self._crop_btn.setToolTip("Обрезать [X]")
         self._crop_btn.toggled.connect(self._on_crop_btn)
 
         self._mosaic_btn = QPushButton("⊞ Mosaic  [M]")
@@ -781,6 +786,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_Delete), self, self._on_delete)
         QShortcut(QKeySequence(Qt.Key.Key_Space),  self, self._toggle_draw_mode)
         QShortcut(QKeySequence(Qt.Key.Key_D),      self, self._delete_current_file)
+        QShortcut(QKeySequence(Qt.Key.Key_C),      self, self._duplicate_current_image)
         QShortcut(QKeySequence("X"),               self, self._toggle_crop_mode)
         QShortcut(QKeySequence("M"),               self, self._apply_mosaic)
         QShortcut(QKeySequence("R"),               self, lambda: self._rotate_image(clockwise=True))
@@ -1368,8 +1374,8 @@ class MainWindow(QMainWindow):
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._pre_edit_state = None
-        self._undo_btn.setEnabled(False)
-        self._redo_btn.setEnabled(False)
+        self._undo_btn.setEnabled(bool(self._split_undo_stack))
+        self._redo_btn.setEnabled(bool(self._split_redo_stack))
 
     def _on_pre_edit_started(self):
         if not self._in_undo:
@@ -1389,22 +1395,24 @@ class MainWindow(QMainWindow):
         if self._pre_mosaic_image is not None:
             self._revert_mosaic()
             return
-        if not self._undo_stack:
-            return
-        self._redo_stack.append(self._current_full_state())
-        state = self._undo_stack.pop()
-        self._restore(state)
-        self._undo_btn.setEnabled(bool(self._undo_stack))
-        self._redo_btn.setEnabled(True)
+        if self._undo_stack:
+            self._redo_stack.append(self._current_full_state())
+            state = self._undo_stack.pop()
+            self._restore(state)
+            self._undo_btn.setEnabled(bool(self._undo_stack) or bool(self._split_undo_stack))
+            self._redo_btn.setEnabled(True)
+        elif self._split_undo_stack:
+            self._undo_split_move()
 
     def _redo(self):
-        if not self._redo_stack:
-            return
-        self._undo_stack.append(self._current_full_state())
-        state = self._redo_stack.pop()
-        self._restore(state)
-        self._undo_btn.setEnabled(True)
-        self._redo_btn.setEnabled(bool(self._redo_stack))
+        if self._redo_stack:
+            self._undo_stack.append(self._current_full_state())
+            state = self._redo_stack.pop()
+            self._restore(state)
+            self._undo_btn.setEnabled(True)
+            self._redo_btn.setEnabled(bool(self._redo_stack) or bool(self._split_redo_stack))
+        elif self._split_redo_stack:
+            self._redo_split_move()
 
     def _restore(self, state):
         self._in_undo = True
@@ -1433,6 +1441,65 @@ class MainWindow(QMainWindow):
         self._dirty = True
         self._save_btn.setEnabled(True)
         self._update_status()
+
+    # ── Split move undo/redo ──────────────────────────────────────────────────
+
+    def _undo_split_move(self):
+        entry = self._split_undo_stack.pop()
+        try:
+            shutil.move(str(entry["dst_path"]), str(entry["src_path"]))
+            if entry["dst_label"].exists():
+                shutil.move(str(entry["dst_label"]), str(entry["src_label"]))
+        except Exception as e:
+            QMessageBox.critical(self, "Undo failed", f"Не удалось вернуть файл:\n{e}")
+            self._split_undo_stack.append(entry)
+            return
+        idx = min(entry["list_idx"], len(self._images))
+        self._images.insert(idx, entry["src_path"])
+        self._image_list.insertItem(idx, QListWidgetItem(entry["src_path"].name))
+        self._image_list.insert_path(idx, entry["src_path"])
+        self._split_redo_stack.append(entry)
+        self._current_idx = -1
+        self._navigate_to(idx)
+        self._undo_btn.setEnabled(bool(self._split_undo_stack))
+        self._redo_btn.setEnabled(True)
+
+    def _redo_split_move(self):
+        entry = self._split_redo_stack.pop()
+        src_path = entry["src_path"]
+        try:
+            entry["dst_path"].parent.mkdir(parents=True, exist_ok=True)
+            entry["dst_label"].parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src_path), str(entry["dst_path"]))
+            if entry["src_label"].exists():
+                shutil.move(str(entry["src_label"]), str(entry["dst_label"]))
+        except Exception as e:
+            QMessageBox.critical(self, "Redo failed", f"Не удалось переместить файл:\n{e}")
+            self._split_redo_stack.append(entry)
+            return
+        if src_path in self._images:
+            actual_idx = self._images.index(src_path)
+            self._image_list.takeItem(actual_idx)
+            self._image_list.remove_path(actual_idx)
+            self._images.pop(actual_idx)
+        else:
+            actual_idx = entry["list_idx"]
+        self._split_undo_stack.append(entry)
+        self._dirty = False
+        self._clear_undo()
+        if self._images:
+            self._current_idx = -1
+            self._navigate_to(min(actual_idx, len(self._images) - 1))
+        else:
+            self._current_idx = -1
+            self._clear_scene()
+            self._save_btn.setEnabled(False)
+            self._dup_btn.setEnabled(False)
+            self._del_file_btn.setEnabled(False)
+            self._update_status()
+            self._update_assign_row()
+        self._undo_btn.setEnabled(True)
+        self._redo_btn.setEnabled(bool(self._split_redo_stack))
 
     # ── Annotation list ───────────────────────────────────────────────────────
 
@@ -1499,7 +1566,7 @@ class MainWindow(QMainWindow):
 
     def _on_draw_mode_toggled(self, checked: bool):
         self._viewer.set_draw_mode(checked)
-        self._draw_btn.setText("✏ Drawing…" if checked else "✏ Draw BBox")
+        self._draw_btn.setText("✏ Рисую…" if checked else "✏ Рамка  [Пробел]")
 
     def _toggle_draw_mode(self):
         self._draw_btn.setChecked(not self._draw_btn.isChecked())
@@ -1582,15 +1649,16 @@ class MainWindow(QMainWindow):
             return
         angle = 90 if clockwise else -90
         rotated = src.transformed(QTransform().rotate(angle))
-        self._pending_image = rotated
         current_anns = self._viewer.get_annotations()
+        pre_rotate_state = {"image": self._pending_image, "anns": list(current_anns)}
         new_anns = recalc_annotations_rotate(current_anns, clockwise)
         classes = self._config.names if self._config else []
+        self._pending_image = rotated
         self._viewer.reload_with_pixmap(
             QPixmap.fromImage(rotated), new_anns, classes)
         self._dirty = True
         self._save_btn.setEnabled(True)
-        self._clear_undo()
+        self._push_undo(pre_rotate_state)
         self._rebuild_ann_list()
         self._update_status()
 
@@ -1913,7 +1981,7 @@ class MainWindow(QMainWindow):
 
     def _update_status(self):
         if not self._images or self._current_idx < 0:
-            self._status_lbl.setText("No images loaded")
+            self._status_lbl.setText("Изображения не загружены")
             self._nav_counter.setText("–")
             return
         n = len(self._images)
@@ -2199,11 +2267,17 @@ class MainWindow(QMainWindow):
             return
 
         idx = self._current_idx
+        self._split_undo_stack.append({
+            "src_path": path, "src_label": label,
+            "dst_path": target_img, "dst_label": target_label,
+            "list_idx": idx,
+        })
+        self._split_redo_stack.clear()
         self._image_list.takeItem(idx)
         self._image_list.remove_path(idx)
         self._images.pop(idx)
         self._dirty = False
-        self._clear_undo()
+        self._clear_undo()  # clears annotation undo; split undo already pushed above
 
         if self._images:
             self._current_idx = -1
