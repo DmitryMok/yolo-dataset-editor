@@ -2438,8 +2438,7 @@ class MainWindow(QMainWindow):
 
         target_dir = self._config.splits.get(target)
         if target_dir is None:
-            declared = self._config.declared.get(target)
-            target_img_dir = declared if declared is not None else self._config.config_dir / target / "images"
+            target_img_dir = self._config.config_dir / target / "images"
             target_lbl_dir = target_img_dir.parent / "labels"
             if target != "review":
                 reply = QMessageBox.question(
